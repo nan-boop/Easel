@@ -10,8 +10,11 @@ import {
   fetchModelChannels, runChannelSelftest, saveModelConfig,
   fetchLocalAgents, enableLocalAgent, fetchAvailableModels,
   fetchProxySettings, saveProxySettings,
+  fetchLanAccessSettings, saveLanAccessSettings,
 } from '../lib/api';
-import type { EnvTool, ModelRow, SelftestResult, LocalAgentInfo, ProxySettings } from '../lib/api';
+import type {
+  EnvTool, ModelRow, SelftestResult, LocalAgentInfo, ProxySettings, LanAccessSettings,
+} from '../lib/api';
 import { IconSlidersHorizontal, IconPackage, IconEllipsis, IconRefreshCw } from './settingsIcons';
 
 interface Props {
@@ -99,12 +102,23 @@ export default function SettingsPanel({ onClose, banner = '' }: Props) {
   const [proxyBusy, setProxyBusy] = useState(false);
   const [proxyMsg, setProxyMsg] = useState('');
   const [proxyErr, setProxyErr] = useState('');
+  const [lanCfg, setLanCfg] = useState<LanAccessSettings | null>(null);
+  const [lanBusy, setLanBusy] = useState(false);
+  const [lanMsg, setLanMsg] = useState('');
+  const [lanErr, setLanErr] = useState('');
 
   useEffect(() => {
     if (sec !== 'more') return;
     fetchProxySettings()
       .then((d) => { setProxyCfg(d); setProxyInput(d.proxy); setProxyErr(''); setProxyMsg(''); })
       .catch(() => setProxyErr('读取代理配置失败'));
+  }, [sec]);
+
+  useEffect(() => {
+    if (sec !== 'more') return;
+    fetchLanAccessSettings()
+      .then((d) => { setLanCfg(d); setLanErr(''); setLanMsg(''); })
+      .catch(() => setLanErr('读取局域网访问配置失败'));
   }, [sec]);
 
   const saveProxy = useCallback(async (value?: string) => {
@@ -123,6 +137,22 @@ export default function SettingsPanel({ onClose, banner = '' }: Props) {
   }, [proxyInput]);
 
   const clearProxy = useCallback(() => { setProxyInput(''); void saveProxy(''); }, [saveProxy]);
+
+  const toggleLan = useCallback(async () => {
+    if (!lanCfg || lanCfg.locked) return;
+    setLanBusy(true); setLanErr(''); setLanMsg('');
+    try {
+      const next = await saveLanAccessSettings(!lanCfg.enabled);
+      setLanCfg(next);
+      setLanMsg(next.enabled
+        ? '局域网访问已开启，同一网络中的设备可通过下方地址访问。'
+        : '局域网访问已关闭，仅本机可以访问。');
+    } catch (e) {
+      setLanErr(e instanceof Error ? e.message : '保存失败');
+    } finally {
+      setLanBusy(false);
+    }
+  }, [lanCfg]);
 
   const batchMode = useRef(false);
 
@@ -959,6 +989,51 @@ export default function SettingsPanel({ onClose, banner = '' }: Props) {
                       保存后立即生效（登录/发布等子进程每次启动都重新读取），无需重启服务。
                       当前生效：{proxyCfg?.proxy || '（未配置，回退系统代理）'}
                     </div>
+                  </div>
+                  <div style={{ padding: 14, borderTop: '1px solid var(--border)' }}>
+                    <div style={{ display: 'flex', alignItems: 'flex-start', gap: 14 }}>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                          <label className="field-label">局域网访问（EASEL_LAN_ACCESS）</label>
+                          <span className={`badge${lanCfg?.enabled ? ' badge-ok' : ''}`}>
+                            {lanCfg ? (lanCfg.enabled ? '已开启' : '已关闭') : '读取中…'}
+                          </span>
+                        </div>
+                        <div className="foot-note">
+                          开启后，同一局域网中的手机、平板或其他电脑可以直接使用 Easel；默认仍然只允许本机访问。
+                        </div>
+                      </div>
+                      <button
+                        className={`btn btn-sm ${lanCfg?.enabled ? 'btn-ghost' : 'btn-primary'}`}
+                        disabled={lanBusy || !lanCfg || lanCfg.locked}
+                        onClick={() => void toggleLan()}
+                      >
+                        {lanBusy ? '保存中…' : lanCfg?.enabled ? '关闭局域网访问' : '开启局域网访问'}
+                      </button>
+                    </div>
+                    {lanCfg?.enabled && lanCfg.urls.length > 0 && (
+                      <div style={{ marginTop: 12 }}>
+                        <div className="foot-note" style={{ marginBottom: 5 }}>局域网访问地址</div>
+                        {lanCfg.urls.map((url) => (
+                          <div key={url} style={{ marginTop: 3 }}>
+                            <a href={url} target="_blank" rel="noreferrer">{url}</a>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {lanCfg?.detail && (
+                      <div className="foot-note" style={{ marginTop: 8 }}>{lanCfg.detail}</div>
+                    )}
+                    {lanCfg?.locked && (
+                      <div className="foot-note" style={{ marginTop: 8 }}>
+                        启动环境已固定 EASEL_LAN_ACCESS，此处只读；请调整启动参数或环境变量后重启。
+                      </div>
+                    )}
+                    {lanErr && <div className="env-error" style={{ marginTop: 8 }}>{lanErr}</div>}
+                    {lanMsg && <div className="foot-note" style={{ marginTop: 8 }}>{lanMsg}</div>}
+                    {lanCfg?.warning && (
+                      <div className="foot-note" style={{ marginTop: 10 }}>{lanCfg.warning}</div>
+                    )}
                   </div>
                   <div className="stub-row"><span className="tag2">预留</span>通用设置（语言 / 更新 / 数据目录）<span className="future">按需加</span></div>
                 </div>

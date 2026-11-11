@@ -27,12 +27,10 @@ import uuid
 import zipfile
 from contextlib import asynccontextmanager
 from dataclasses import replace
-import ipaddress
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field, StrictBool
 from sse_starlette.sse import EventSourceResponse
@@ -548,6 +546,7 @@ SKILL_API_REQUIREMENTS: dict[str, dict] = {
 _ENV_ALLOWLIST: set[str] = {
     "EASEL_DIRECT_API_BASE_URL", "EASEL_DIRECT_API_KEY", "EASEL_DIRECT_API_MODEL",
     "EASEL_PROXY",   # 设置页「网络代理」持久化（_write_env 支持空串删行=清除）
+    "EASEL_LAN_ACCESS",   # 设置页「局域网访问」持久化；空串=关闭
 }
 for _spec in SKILL_API_REQUIREMENTS.values():
     for _key in _spec.get("settings", []):
@@ -561,6 +560,18 @@ for _spec in SKILL_API_REQUIREMENTS.values():
 ENV_FILE = PROJECT_ROOT / ".env"
 _HARNESS_LOOP = None
 _PLACEHOLDER_RE = re.compile(r"replace_me|your[-_]?api[-_]?key|xxx|^\.{3}$|^<.*>$", re.I)
+LAN_ACCESS_ENV = "EASEL_LAN_ACCESS"
+
+
+def _env_truthy(value: object) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+_LAN_ACCESS_LOCKED = LAN_ACCESS_ENV in os.environ
+_LAN_ACCESS_ENABLED = _env_truthy(
+    os.environ.get(LAN_ACCESS_ENV)
+    if _LAN_ACCESS_LOCKED else read_settings(ENV_FILE).get(LAN_ACCESS_ENV)
+)
 
 TEXT_EXTS = {".txt", ".md", ".json", ".csv", ".log", ".py", ".js", ".ts", ".html", ".htm", ".css", ".xml", ".yaml", ".yml", ".srt", ".vtt"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
@@ -619,6 +630,91 @@ if _proxy_origin:
     _LOCAL_ORIGINS.append(_proxy_origin[1])
 
 
+def _lan_ipv4_addresses() -> list[str]:
+    """返回本机可用于局域网访问的私有 IPv4 地址。"""
+    found: set[str] = set()
+    try:
+        for info in socket.getaddrinfo(
+                socket.gethostname(), None, socket.AF_INET, socket.SOCK_STREAM):
+            raw = str(info[4][0])
+            try:
+                addr = ipaddress.ip_address(raw)
+            except ValueError:
+                continue
+            if (addr.version == 4 and addr.is_private and not addr.is_loopback
+                    and not addr.is_link_local and not addr.is_unspecified):
+                found.add(str(addr))
+    except OSError:
+        pass
+    try:
+        fallback = socket.gethostbyname(socket.gethostname())
+        addr = ipaddress.ip_address(fallback)
+        if (addr.is_private and not addr.is_loopback and not addr.is_link_local
+                and not addr.is_unspecified):
+            found.add(str(addr))
+    except (OSError, ValueError):
+        pass
+    return sorted(found)
+
+
+def _lan_urls() -> list[str]:
+    try:
+        port = int(os.environ.get("EASEL_PORT", "7860"))
+    except ValueError:
+        port = 7860
+    return [f"http://{address}:{port}" for address in _lan_ipv4_addresses()]
+
+
+def _lan_state() -> dict:
+    source = "env" if _LAN_ACCESS_LOCKED else (
+        "envfile" if _LAN_ACCESS_ENABLED else "none")
+    try:
+        port = int(os.environ.get("EASEL_PORT", "7860"))
+    except ValueError:
+        port = 7860
+    urls = _lan_urls()
+    warning = (
+        "局域网访问没有登录鉴权，同一网络内的设备可直接操作工作台。"
+        "只建议在家用或可信办公网络开启，不要映射到公网，也不要在公共 Wi-Fi 使用。"
+        "Windows 首次开启时如弹出防火墙提示，请只允许“专用网络”。"
+    )
+    return {
+        "enabled": _LAN_ACCESS_ENABLED,
+        "source": source,
+        "locked": _LAN_ACCESS_LOCKED,
+        "urls": urls,
+        "port": port,
+        "warning": warning,
+        "detail": "" if urls else "未发现可用的私有 IPv4 地址，请先连接局域网。",
+    }
+
+
+def _host_allowed(host: str) -> bool:
+    normalized = (host or "").strip().lower().rstrip(".")
+    if not normalized:
+        return False
+    local_names = {
+        "localhost", "127.0.0.1", "::1",
+        socket.gethostname().strip().lower().rstrip("."),
+        socket.getfqdn().strip().lower().rstrip("."),
+        *(item.strip().lower().rstrip(".") for item in _EXTRA_HOSTS),
+    }
+    if normalized in local_names:
+        return True
+    if not _LAN_ACCESS_ENABLED:
+        return False
+    try:
+        addr = ipaddress.ip_address(normalized.strip("[]"))
+    except ValueError:
+        if normalized.endswith(".local"):
+            return normalized[:-6] == socket.gethostname().strip().lower().rstrip(".")
+        return False
+    return bool(
+        addr.is_private and not addr.is_loopback
+        and not addr.is_link_local and not addr.is_unspecified
+    )
+
+
 def _loopback_peer(request: Request) -> bool:
     """对端是否来自回环地址。只有「没有 Origin 可判」时才用作判据。"""
     client = request.client
@@ -631,8 +727,47 @@ def _loopback_peer(request: Request) -> bool:
         return False
 
 
+def _private_peer(request: Request) -> bool:
+    """对端是否位于私有局域网内。"""
+    client = request.client
+    if client is None:
+        return False
+    try:
+        addr = ipaddress.ip_address(client.host or "")
+    except ValueError:
+        return False
+    return bool(
+        addr.is_private and not addr.is_link_local
+        and not addr.is_unspecified and not addr.is_multicast
+    )
+
+
+def _same_origin(origin: str, request: Request) -> bool:
+    try:
+        source = urllib.parse.urlsplit(origin)
+    except ValueError:
+        return False
+    target = request.url
+    default_ports = {"http": 80, "https": 443}
+    source_port = source.port or default_ports.get(source.scheme, 0)
+    target_port = target.port or default_ports.get(target.scheme, 0)
+    return bool(
+        source.scheme == target.scheme
+        and (source.hostname or "").lower().rstrip(".") == (target.hostname or "").lower().rstrip(".")
+        and source_port == target_port
+    )
+
+
 app.add_middleware(CORSMiddleware, allow_origins=_LOCAL_ORIGINS, allow_methods=["*"], allow_headers=["*"])
-app.add_middleware(TrustedHostMiddleware, allowed_hosts=['localhost', '127.0.0.1'] + _EXTRA_HOSTS)
+
+
+@app.middleware('http')
+async def trusted_host_guard(request: Request, call_next):
+    """按当前局域网开关校验 Host，避免 DNS rebinding 与错误的 Host 转发。"""
+    if not _host_allowed(request.url.hostname or ""):
+        return JSONResponse({'detail': 'Host 未被允许。若需局域网访问，请在设置中开启。'},
+                            status_code=400)
+    return await call_next(request)
 
 
 @app.middleware('http')
@@ -665,7 +800,14 @@ async def local_write_guard(request: Request, call_next):
         response.headers.update(headers)
         return response
     if request.method not in ('GET', 'HEAD', 'OPTIONS'):
-        allowed = origin in _LOCAL_ORIGINS if origin else _loopback_peer(request)
+        lan_same_origin = (
+            _LAN_ACCESS_ENABLED and _private_peer(request)
+            and (not origin or _same_origin(origin, request))
+        )
+        allowed = (
+            (origin in _LOCAL_ORIGINS if origin else _loopback_peer(request))
+            or lan_same_origin
+        )
         if not allowed:
             return JSONResponse({'detail': '仅允许从本机工作台操作。'}, status_code=403)
     return await call_next(request)
@@ -2009,6 +2151,27 @@ async def api_settings_proxy_save(req: ProxyRequest):
             raise HTTPException(400, '代理地址需形如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080（不含用户名密码）')
     _write_env({'EASEL_PROXY': proxy})   # 空串 → 删除该行（清除代理）
     return {'ok': True, 'proxy': proxy, 'source': 'envfile' if proxy else 'none'}
+
+
+class LanAccessRequest(BaseModel):
+    enabled: StrictBool
+
+
+@app.get("/api/settings/lan")
+async def api_settings_lan_get():
+    """读取局域网访问开关与本机可访问地址；默认关闭。"""
+    return _lan_state()
+
+
+@app.post("/api/settings/lan")
+async def api_settings_lan_save(req: LanAccessRequest):
+    """持久化局域网访问开关。服务始终绑定 0.0.0.0，保存后立即生效。"""
+    global _LAN_ACCESS_ENABLED
+    if _LAN_ACCESS_LOCKED:
+        raise HTTPException(409, '启动环境已指定 EASEL_LAN_ACCESS，请修改启动环境后重启')
+    _write_env({LAN_ACCESS_ENV: '1' if req.enabled else ''})
+    _LAN_ACCESS_ENABLED = bool(req.enabled)
+    return _lan_state()
 
 
 @app.get("/api/settings/models")

@@ -1133,6 +1133,29 @@ export function saveProxySettings(proxy: string): Promise<{ ok: boolean; proxy: 
   });
 }
 
+// ── 局域网访问（EASEL_LAN_ACCESS；更多设置页） ──────────────────────
+
+export interface LanAccessSettings {
+  enabled: boolean;
+  source: 'env' | 'envfile' | 'none';
+  locked: boolean;
+  urls: string[];
+  port: number;
+  warning: string;
+  detail: string;
+}
+
+export function fetchLanAccessSettings(): Promise<LanAccessSettings> {
+  return request('/api/settings/lan');
+}
+
+export function saveLanAccessSettings(enabled: boolean): Promise<LanAccessSettings> {
+  return request('/api/settings/lan', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  });
+}
+
 // ═══ 设置面板 · 系统更新 ═══
 
 export type UpdateStepState = 'pending' | 'active' | 'done' | 'fail' | 'skipped';
