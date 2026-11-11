@@ -74,7 +74,29 @@ export default function DashboardPage({ persona, gatewayStatus, apiDirect, agent
     fetchTrends(undefined, 6).then((d) => setTrends(d.trends)).catch(() => {});
     fetchSchedule().then(setSchedule).catch(() => {});
     fetchOutputs().then(setOutputs).catch(() => {});
-    fetchAccounts().then(setAccounts).catch(() => {});
+    fetchAccounts().then((list) => {
+      setAccounts(list);
+      // 旧浏览器可能缓存了“已登录=False”的分析结果；账号服务端状态更新后先丢弃这类假阴性。
+      const current = new Map(list.map((account) => [account.platform, account.loggedIn]));
+      setAnaData((previous) => {
+        let changed = false;
+        const next = { ...previous };
+        for (const [platform, value] of Object.entries(next)) {
+          if (current.get(platform) && value && typeof value === 'object' && value.loggedIn === false) {
+            delete next[platform];
+            changed = true;
+          }
+        }
+        if (changed) {
+          try {
+            const cache = Object.fromEntries(Object.entries(next).filter(([, value]) =>
+              value && typeof value === 'object'));
+            localStorage.setItem('easel_analytics', JSON.stringify(cache));
+          } catch { /* quota */ }
+        }
+        return changed ? next : previous;
+      });
+    }).catch(() => {});
     fetchIdeas().then(setIdeas).catch(() => {});
     fetchAnalyticsPlatforms().then((ps) => {
       setAnaPlats(ps);
@@ -93,6 +115,14 @@ export default function DashboardPage({ persona, gatewayStatus, apiDirect, agent
         },
       });
     }).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    const onRefresh = () => {
+      fetchTrends(undefined, 6).then((d) => setTrends(d.trends)).catch(() => {});
+    };
+    window.addEventListener('easel:trends-refresh', onRefresh);
+    return () => window.removeEventListener('easel:trends-refresh', onRefresh);
   }, []);
 
   const runAna = (platform: string) => {
@@ -260,6 +290,8 @@ export default function DashboardPage({ persona, gatewayStatus, apiDirect, agent
               );
             }
             const d = anaSel ? anaData[anaSel] : undefined;
+            const accountLoggedIn = Boolean(accounts.find((account) => account.platform === anaSel)?.loggedIn
+              || whoamiMap[anaSel]?.loggedIn);
             const WIN: [typeof anaWin, string][] = [
               ['last', '较上次'], ['day', '较昨日'], ['week', '较上周'], ['month', '较上月'], ['year', '较去年'],
             ];
@@ -278,12 +310,17 @@ export default function DashboardPage({ persona, gatewayStatus, apiDirect, agent
                 {d === 'error' && (
                   <div className="dash-empty" style={{ color: 'var(--red)' }}>{anaErrors[anaSel] || '抓取失败，请稍后重试'}；点平台重试</div>
                 )}
-                {d && d !== 'loading' && d !== 'error' && (!d.loggedIn ? (
+                {d && d !== 'loading' && d !== 'error' && (!d.loggedIn && !accountLoggedIn ? (
                   <div className="dash-empty" onClick={() => onNavigate('accounts')} style={{ cursor: 'pointer' }}>
                     该平台登录态已失效，去账号页重登 →
                   </div>
                 ) : (
                   <div className="ana-body">
+                    {!d.loggedIn && accountLoggedIn && (
+                      <div className="dash-empty" role="status" style={{ gridColumn: '1 / -1' }}>
+                        账号已登录；最近一次数据抓取未完成，点上方平台或「刷新」重试。
+                      </div>
+                    )}
                     {d.warning && <div className="dash-empty" role="status" style={{ gridColumn: '1 / -1' }}>{d.warning}</div>}
                     {/* 概览 + 增长对比 */}
                     <div className="ana-col ana-col-main">

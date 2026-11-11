@@ -43,6 +43,7 @@ export default function HarnessSettings({ onChange, onSelect }: {
   }, [onChange, onSelect, refresh]);
 
   const selected = settings?.agents.find((agent) => agent.id === runtime);
+  const fullAccess = sandbox === 'danger-full-access';
   const nativeModels = catalogs[runtime] || [];
   const pullModels = async () => {
     const requested = runtime;
@@ -69,7 +70,9 @@ export default function HarnessSettings({ onChange, onSelect }: {
       const value = await saveHarnessSettings(runtime, model, sandbox, runtime === 'codex' ? autoApprove : undefined);
       setSettings(value);
       onChange(value.runtime);
-      setNote('已保存，请新建对话；旧对话仍保留在原底座，不迁移历史。');
+      setNote(runtime === 'codex' && sandbox === 'danger-full-access'
+        ? '已保存并立即生效。当前对话及后续对话的本机执行授权都会自动放行，不再逐次询问。'
+        : '已保存，请新建对话；旧对话仍保留在原底座，不迁移历史。');
     } catch (error) {
       setNote(`保存失败：${error instanceof Error ? error.message : String(error)}`);
     } finally {
@@ -158,36 +161,47 @@ export default function HarnessSettings({ onChange, onSelect }: {
           {runtime === 'codex' && (
             <>
             <div className="settings-field">
-              <span className="settings-field-label">Codex 沙箱</span>
+              <span className="settings-field-label">Codex 权限模式</span>
               <div className="settings-field-body">
-                <SettingsSelect label="Codex 沙箱" value={sandbox} disabled={busy || settings?.locked}
+                <SettingsSelect label="Codex 权限模式" value={sandbox} disabled={busy || settings?.locked}
                   options={[
                     { value: 'workspace-write', label: '项目工作区写入' },
+                    { value: 'danger-full-access', label: '完全访问（自动授权）' },
                     { value: 'read-only', label: '只读' },
                   ]}
                   onChange={setSandbox} />
-                <p className="desc">保留所选沙箱边界，不授予系统完全访问权限。</p>
+                <p className="desc">{fullAccess
+                  ? '可读写本机任意路径并运行命令，同时跳过 Codex 的逐次执行授权。仅在信任当前任务时使用。'
+                  : '保留所选沙箱边界；完全访问模式才会获得系统级读写能力。'}</p>
+                {fullAccess && <div className="notice-error" role="alert">
+                  完全访问风险最高：Agent 可修改工作区外文件、运行系统命令或访问网络。
+                  如只做内容创作和项目文件整理，优先使用「项目工作区写入」。
+                </div>}
               </div>
             </div>
             <div className="settings-field">
-              <label className="settings-field-label" htmlFor="codex-auto-approve">永久通过授权</label>
+              <label className="settings-field-label" htmlFor="codex-auto-approve">普通操作自动授权</label>
               <div className="settings-field-body">
                 <button id="codex-auto-approve" type="button" role="switch"
-                  aria-checked={autoApprove} aria-label="永久通过授权"
+                  aria-checked={autoApprove} aria-label="普通操作自动授权"
                   aria-describedby="codex-auto-approve-help" className="settings-permission-switch"
-                  disabled={busy || settingsLoading || !settings || settings.locked}
+                  disabled={busy || settingsLoading || !settings || settings.locked || fullAccess}
                   onClick={() => setAutoApprove((previous) => !previous)}>
                   <span className="settings-permission-switch__thumb" />
                 </button>
-                <p id="codex-auto-approve-help" className="desc">保存后持续生效，仅影响 Easel 的 Codex：
-                  自动批准普通文件读取、搜索、Git 查看/拉取，以及项目工作区内的文件修改授权。
-                  sudo、删除、系统修改、执行脚本及无法判断安全性的操作仍需确认；不是无限权限，可随时关闭。</p>
+                <p id="codex-auto-approve-help" className="desc">{fullAccess
+                  ? '完全访问模式已包含自动授权，无需再开启此项。'
+                  : <>保存后持续生效，仅影响 Easel 的 Codex：
+                    自动批准普通文件读取、搜索、Git 查看/拉取，以及项目工作区内的文件修改授权。
+                    删除、系统修改、执行脚本及无法判断安全性的操作仍需确认；不是无限权限，可随时关闭。</>}</p>
               </div>
             </div>
             </>
           )}
-          <p className="desc">认证由原生 CLI 管理，Easel 不迁移密钥。未自动批准的额外权限需在对话中确认；
-            OpenCode / 通用 ACP 使用其原生权限策略，不是 Codex 沙箱。</p>
+          <p className="desc">认证由原生 CLI 管理，Easel 不迁移密钥。
+            {fullAccess ? '完全访问模式下，Codex 不会再弹出技术执行授权；'
+              : '未自动批准的额外权限需在对话中确认；'}
+            OpenCode / 通用 ACP 使用其原生权限策略，不是 Codex 权限模式。</p>
           <p className="desc"><code>{selected?.install_hint}</code></p>
           <p className="desc">“已安装”仅表示找到 CLI，不代表模型已登录；保存后请发送消息验证。</p>
         </>

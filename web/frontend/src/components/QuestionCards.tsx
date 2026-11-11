@@ -53,14 +53,36 @@ function QuestionCard({ question, onAnswered, onClosed }: { question: ChatQuesti
   const valsOf = (it: ChatQuestionItem): string[] => selected[it.questionId] || [];
   const allAnswered = items.length > 0 && items.every((it) => valsOf(it).length > 0);
 
-  const pick = (it: ChatQuestionItem, label: string) => {
+  async function sendAnswers(answers: Record<string, string[]>) {
+    if (busy || locked) return;
+    setBusy(true); setError('');
+    try {
+      const res = await answerQuestion({ questionId: question.id, answers });
+      if (!res.ok && (res.expired || (res.status && res.status !== 'pending'))) {
+        setClosed(res.status || 'expired');
+        onClosed?.(res.status || 'expired');
+        setError('该问题已过期或关闭。若仍需补充，请在聊天输入框发送答复。');
+      } else if (!res.ok) setError(res.error || '提交失败');
+      else onAnswered();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const pick = async (it: ChatQuestionItem, label: string) => {
+    const cur = selected[it.questionId] || [];
+    const next = it.multiSelect
+      ? (cur.includes(label) ? cur.filter((v) => v !== label) : [...cur, label])
+      : [label];
     setSelected((s) => {
-      const cur = s[it.questionId] || [];
-      const next = it.multiSelect
-        ? (cur.includes(label) ? cur.filter((v) => v !== label) : [...cur, label])
-        : [label];
       return { ...s, [it.questionId]: next };
     });
+    // 完全访问是一次性确认：点选即提交，不再要求用户额外点一次“提交”。
+    if (items.length === 1 && it.questionId === 'permission' && label.includes('完全访问')) {
+      await sendAnswers({ [it.questionId]: next });
+    }
   };
 
   const fillCustom = (it: ChatQuestionItem) => {
@@ -83,22 +105,9 @@ function QuestionCard({ question, onAnswered, onClosed }: { question: ChatQuesti
 
   const submit = async () => {
     if (locked || !allAnswered) return;
-    setBusy(true); setError('');
     const answers: Record<string, string[]> = {};
     for (const it of items) answers[it.questionId] = valsOf(it);
-    try {
-      const res = await answerQuestion({ questionId: question.id, answers });
-      if (!res.ok && (res.expired || (res.status && res.status !== 'pending'))) {
-        setClosed(res.status || 'expired');
-        onClosed?.(res.status || 'expired');
-        setError('该问题已过期或关闭。若仍需补充，请在聊天输入框发送答复。');
-      } else if (!res.ok) setError(res.error || '提交失败');
-      else onAnswered();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(false);
-    }
+    await sendAnswers(answers);
   };
 
   return (
@@ -127,7 +136,7 @@ function QuestionCard({ question, onAnswered, onClosed }: { question: ChatQuesti
                     <button key={opt.label}
                       className={`question-card__option${vals.includes(opt.label) ? ' question-card__option--selected' : ''}`}
                       disabled={locked}
-                      onClick={() => pick(it, opt.label)}>
+                      onClick={() => void pick(it, opt.label)}>
                       <strong>{opt.label}</strong>
                       {opt.description && <span>{opt.description}</span>}
                     </button>

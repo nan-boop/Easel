@@ -1698,8 +1698,9 @@ def cmd_login_qr(a) -> int:
                 print(f"✅ {cfg['name']} 已登录（登录态在持久化目录）")
                 return 0
 
-            # 窗口登录模式（X：无扫码）：不截二维码，写 window_login 状态后纯轮询登录态
-            if window_mode and cfg.get("login_mode") == "window":
+            # 有头窗口登录：不依赖二维码截取，用户在可见浏览器里完成扫码、
+            # 短信或账号密码登录；后端只轮询登录态并持久化会话。
+            if window_mode:
                 login_state.write_status(
                     sf, "window_login",
                     f"请在运行 Easel 的电脑弹出的浏览器窗口里登录 {cfg['name']}，完成后窗口会自动关闭。该方式需要图形桌面。")

@@ -26,6 +26,7 @@ import urllib.request
 import uuid
 import zipfile
 from contextlib import asynccontextmanager
+from dataclasses import replace
 import ipaddress
 from pathlib import Path
 
@@ -49,9 +50,11 @@ from easel.persona import (load_profile_text, persona_prefix, chat_turn_message,
                            profile_exists, valid_persona_name, _FILE_ORDER)
 from easel.timeouts import TIMEOUT_CHAT, TIMEOUT_DIRECT, TIMEOUT_PRODUCE
 from easel.manual_publish import build_package, publishing_mode
+from easel.session_store import SessionStore, SessionStoreError
 from easel.direct_api import (DirectAPIError, SYSTEM_PROMPT, api_config, api_mode,
                               history_path, read_settings, stream_chat)
 from easel import harnesses
+from easel import update as easel_update
 from easel.harnesses import store as harness_store
 from easel.harnesses.base import HarnessError, RunRequest
 try:
@@ -334,6 +337,8 @@ PUBLISH_DIR = OUTPUTS_DIR / "_publish"   # 异步发布的状态/验证码文件
 PROFILE_BUILD_DIR = OUTPUTS_DIR / "_profile_build"   # 异步画像构建的状态文件（避免长请求被代理超时）
 DEBUG_DIR = OUTPUTS_DIR / "_debug"   # 诊断日志（对话流收尾情况等），_ 前缀不进内容库
 SESSIONS_DIR = OUTPUTS_DIR / "_sessions"   # 每会话最近一轮的完整结果，供 SSE 连接中断后前端取回
+STATE_DIR = OUTPUTS_DIR / "_state"         # 会话/草稿等跨浏览器业务状态（更新时保留）
+SESSION_STORE = SessionStore(STATE_DIR / "easel.sqlite")
 # 非 _ 前缀的历史系统目录（归因层数据），内容库不展示（真产物一律在项目目录内）
 SYSTEM_TOPLEVEL_DIRS = {"analytics"}
 LOGIN_TIMEOUT = 240
@@ -1677,6 +1682,51 @@ async def api_env_job(job_id: str):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# 设置面板 · 系统更新（固定从用户 Fork 检查并快进更新）
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@app.get("/api/update")
+async def api_update_info():
+    """快速返回本地版本、仓库状态和上一次更新任务；不访问网络。"""
+    return await asyncio.to_thread(easel_update.current_snapshot)
+
+
+@app.post("/api/update/check")
+async def api_update_check():
+    """检查 Fork 最新提交；只 fetch 目标分支对象，不会改动工作区文件。"""
+    try:
+        return await asyncio.to_thread(easel_update.check_update)
+    except easel_update.UpdateError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.get("/api/update/status")
+async def api_update_status():
+    """更新任务进度；状态落盘，因此即使 Web 进程重启后也能继续查询。"""
+    return await asyncio.to_thread(easel_update.read_status)
+
+
+class UpdateApplyRequest(BaseModel):
+    restart: bool = True
+
+
+@app.post("/api/update/apply")
+async def api_update_apply(req: UpdateApplyRequest | None = None):
+    """启动独立后台更新进程；拉取、安装、构建并尽可能自动重启。"""
+    restart = True if req is None else req.restart
+    try:
+        job = await asyncio.to_thread(
+            easel_update.start_update,
+            server_pid=os.getpid() if restart else 0,
+            port=int(os.environ.get("EASEL_PORT", "7860")),
+        )
+    except easel_update.UpdateError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return job
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # 设置面板 · 模型配置（v1：按真实 .env / openclaw.json 只读展示 + 真自测）
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -1879,8 +1929,8 @@ async def api_harness_settings():
 async def api_harness_settings_save(req: HarnessSettingsRequest):
     if req.runtime not in harness_store.IDS:
         raise HTTPException(400, "未知 Agent 底座")
-    if req.sandbox not in ("read-only", "workspace-write"):
-        raise HTTPException(400, "请选择只读或工作区写入权限")
+    if req.sandbox not in ("read-only", "workspace-write", "danger-full-access"):
+        raise HTTPException(400, "请选择只读、工作区写入或完全访问权限")
     if any(ord(character) < 32 for character in req.model):
         raise HTTPException(400, "模型名称不能包含控制字符")
     if "EASEL_AGENT_RUNTIME" in read_settings(ENV_FILE):
@@ -4181,6 +4231,180 @@ class SkillRequest(BaseModel):
     persona: str | None = None
 
 
+class BreakdownReadRequest(BaseModel):
+    url: str = Field(max_length=2048)
+
+
+def _xhs_cli_path() -> Path:
+    configured = os.environ.get("EASEL_XHS_CLI", "").strip()
+    candidates = [
+        Path(configured) if configured else None,
+        Path.home() / ".local" / "bin" / "xhs.exe",
+        Path(shutil.which("xhs.exe") or ""),
+        Path(shutil.which("xhs") or ""),
+    ]
+    for candidate in candidates:
+        if candidate is not None and candidate.is_file():
+            return candidate
+    raise HTTPException(503, "未找到小红书 CLI，请先安装 xhs 命令")
+
+
+def _xhs_note_url(value: str) -> str:
+    url = value.strip()
+    if not url or len(url) > 2048 or any(char.isspace() or ord(char) < 32 for char in url) or "\\" in url:
+        raise HTTPException(400, "小红书链接格式不正确")
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        host = (parsed.hostname or "").lower()
+    except ValueError:
+        raise HTTPException(400, "小红书链接格式不正确") from None
+    if parsed.scheme not in ("http", "https") or not host or parsed.username or parsed.password:
+        raise HTTPException(400, "小红书链接格式不正确")
+    if not (host == "xiaohongshu.com" or host.endswith(".xiaohongshu.com")
+            or host == "xhslink.com" or host.endswith(".xhslink.com")):
+        raise HTTPException(400, "目前只支持小红书笔记链接，请粘贴正文或换用小红书链接")
+    return url
+
+
+def _xhs_count(value: object) -> str:
+    if isinstance(value, bool):
+        return "0"
+    if isinstance(value, (int, float)):
+        return str(max(0, int(value)))
+    if isinstance(value, str):
+        text = value.strip()
+        return text[:32] or "0"
+    return "0"
+
+
+def _read_xhs_note(url: str) -> dict:
+    cli = _xhs_cli_path()
+    environment = os.environ.copy()
+    environment.update(PYTHONUTF8="1", PYTHONIOENCODING="utf-8", NO_COLOR="1")
+    try:
+        result = subprocess.run(
+            [str(cli), "read", url, "--json"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=25, env=environment, shell=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        raise HTTPException(502, "读取小红书笔记超时，请稍后重试") from None
+    try:
+        payload = json.loads(result.stdout.decode("utf-8-sig").strip())
+    except (UnicodeError, ValueError, TypeError):
+        raise HTTPException(502, "小红书返回了无法解析的数据") from None
+    if not isinstance(payload, dict):
+        raise HTTPException(502, "小红书返回了无法解析的数据")
+    if payload.get("ok") is False:
+        error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+        code = error.get("code") if isinstance(error.get("code"), str) else ""
+        if code == "verification_required":
+            _write_xhs_verification(
+                "required", "小红书触发安全验证，请在打开的浏览器窗口完成验证",
+                url="https://www.xiaohongshu.com/explore", cause="required")
+            try:
+                _start_xhs_verification()
+            except Exception:
+                pass
+            raise HTTPException(409, "小红书需要安全验证，已打开验证窗口，完成后再试")
+        if code == "not_authenticated":
+            _write_xhs_verification(
+                "login_required", "小红书登录态已失效，请在打开的浏览器窗口重新登录",
+                url="https://www.xiaohongshu.com/explore", cause="login_required")
+            try:
+                _start_xhs_verification()
+            except Exception:
+                pass
+            raise HTTPException(409, "小红书登录态已失效，请到账号页重新登录")
+        if code == "ip_blocked":
+            _write_xhs_verification(
+                "blocked", "小红书当前限制了本机网络，请切换网络后重试",
+                url="https://www.xiaohongshu.com/explore", cause="blocked")
+            try:
+                _start_xhs_verification()
+            except Exception:
+                pass
+            raise HTTPException(409, "小红书限制了当前网络，请切换网络后重试")
+        raise HTTPException(502, "读取小红书笔记失败，可能已删除或仅自己可见")
+
+    data = payload.get("data")
+    note = data if isinstance(data, dict) else {}
+    items = note.get("items")
+    if isinstance(items, list) and items:
+        first = items[0] if isinstance(items[0], dict) else {}
+        candidate = first.get("note_card") or first.get("note") or first
+        note = candidate if isinstance(candidate, dict) else {}
+    elif isinstance(note.get("note_card"), dict):
+        note = note["note_card"]
+    if not note:
+        raise HTTPException(502, "没有从链接中读取到笔记内容")
+
+    title = note.get("title") if isinstance(note.get("title"), str) else ""
+    desc = note.get("desc") if isinstance(note.get("desc"), str) else ""
+    title = "".join(char for char in title if char >= " " and char != "\x7f")[:200].strip()
+    desc = "".join(char for char in desc if char >= " " or char in "\n\t")[:12000].strip()
+    user = note.get("user") if isinstance(note.get("user"), dict) else {}
+    author = user.get("nickname") if isinstance(user.get("nickname"), str) else ""
+    author = "".join(char for char in author if char >= " " and char != "\x7f")[:80].strip()
+    tags = []
+    raw_tags = note.get("tag_list")
+    if isinstance(raw_tags, list):
+        for tag in raw_tags[:40]:
+            if not isinstance(tag, dict):
+                continue
+            name = tag.get("name")
+            if isinstance(name, str) and name.strip():
+                tags.append("#" + "".join(char for char in name if char >= " " and char != "\x7f")[:40])
+    interact = note.get("interact_info") if isinstance(note.get("interact_info"), dict) else {}
+    likes = _xhs_count(interact.get("liked_count"))
+    collects = _xhs_count(interact.get("collected_count"))
+    comments = _xhs_count(interact.get("comment_count"))
+    shares = _xhs_count(interact.get("share_count"))
+    image_count = len(note.get("image_list")) if isinstance(note.get("image_list"), list) else 0
+    published = ""
+    stamp = note.get("time")
+    if isinstance(stamp, (int, float)) and not isinstance(stamp, bool) and stamp > 0:
+        try:
+            published = time.strftime("%Y-%m-%d", time.localtime(stamp / 1000))
+        except (OSError, OverflowError, ValueError):
+            published = ""
+
+    lines = [f"标题：{title or '（无标题）'}"]
+    if author:
+        lines.append(f"作者：{author}")
+    if published:
+        lines.append(f"发布时间：{published}")
+    lines.append(f"正文：\n{desc or '（无正文）'}")
+    if tags:
+        lines.append("话题：" + " ".join(tags))
+    lines.append(f"互动数据：赞 {likes} / 藏 {collects} / 评 {comments} / 分享 {shares}")
+    lines.append(f"图片数量：{image_count}")
+    lines.append(f"链接：{url}")
+    text = "\n".join(lines)[:16000]
+    return {
+        "ok": True,
+        "text": text,
+        "note": {
+            "title": title,
+            "author": author,
+            "desc": desc,
+            "tags": tags,
+            "published_at": published,
+            "likes": likes,
+            "collects": collects,
+            "comments": comments,
+            "shares": shares,
+            "image_count": image_count,
+            "url": url,
+        },
+    }
+
+
+@app.post("/api/breakdown/read")
+async def api_breakdown_read(req: BreakdownReadRequest):
+    return await asyncio.to_thread(_read_xhs_note, _xhs_note_url(req.url))
+
+
 @app.post("/api/skill")
 async def api_skill(req: SkillRequest):
     if _direct_api_enabled():
@@ -4542,8 +4766,12 @@ async def _start_login(platform: str, restart: bool = False):
         except OSError:
             pass
     if backend == 'xhs':
+        # Xiaohongshu treats headless Chromium as an untrusted client and may return
+        # 300012 before the QR code is rendered. The desktop app must always use a
+        # headed CloakBrowser/Chrome window so the user can scan and confirm login.
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'xhs_publish.py'), 'login', '--no-proxy',
-               '--qr-out', str(qr), '--status-file', str(status), '--timeout', str(LOGIN_TIMEOUT)]
+               '--headed', '--qr-out', str(qr), '--status-file', str(status),
+               '--timeout', str(LOGIN_TIMEOUT)]
     elif backend == 'biliup':
         # B站：TV 端扫码登录 API 生成二维码 + 写 biliup cookie（biliup login 需真终端，前端用不了）
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'bili_login.py'), 'login',
@@ -4556,7 +4784,7 @@ async def _start_login(platform: str, restart: bool = False):
         except OSError:
             pass
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'douyin_publish.py'), 'login',
-               '--no-proxy',
+               '--no-proxy', '--headed',
                '--qr-out', str(qr), '--status-file', str(status),
                '--sms-code-file', str(code_file), '--timeout', str(LOGIN_TIMEOUT)]
     elif backend == 'toutiao':
@@ -4567,10 +4795,7 @@ async def _start_login(platform: str, restart: bool = False):
     else:
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'web_publisher.py'), 'login-qr',
                '--platform', cfg['wp'], '--qr-out', str(qr), '--status-file', str(status),
-               '--timeout', str(LOGIN_TIMEOUT)]
-        if cfg.get('login_window'):
-            # 无扫码平台（X）：弹有头窗口手动登录，前端按 window_login 状态展示提示
-            cmd.append('--headed')
+               '--timeout', str(LOGIN_TIMEOUT), '--headed']
     # 新登录开始 → 清掉旧的 whoami 缓存（登录前可能缓存了「未登录」），避免登录成功后仍读到旧结果
     with _WHOAMI_LOCK:
         _WHOAMI_CACHE.pop(platform, None)
@@ -4730,7 +4955,8 @@ async def api_mp_login_start(platform: str):
     wx_proxy = os.environ.get("EASEL_PROXY") or os.environ.get("https_proxy") or ""
     cmd = [sys.executable, str(SHARED_SCRIPTS / "weixin_mp_stats.py"), "login",
            "--proxy", wx_proxy, "--qr-out", str(LOGIN_DIR / "wechat-oa-mp.png"),
-           "--status-file", str(LOGIN_DIR / "wechat-oa-mp.json"), "--timeout", "240"]
+           "--status-file", str(LOGIN_DIR / "wechat-oa-mp.json"), "--timeout", "240",
+           "--headed"]
     log_file = (LOGIN_DIR / "wechat-oa-mp.log").open("a", encoding="utf-8")
     env = _proxy_env()
     env.update(PYTHONUTF8='1', PYTHONIOENCODING='utf-8')
@@ -4922,6 +5148,16 @@ async def api_logout(platform: str):
         if BROWSER_PROFILES.resolve() in pdir.parents and pdir.is_dir():
             shutil.rmtree(pdir, ignore_errors=True)
             deleted.append(prof_name)
+    if cfg['backend'] == 'xhs':
+        # Playwright Profile 之外还保留了一份服务端 Cookie 副本（用于跨
+        # Edge/Ego 恢复登录态）；退出登录必须一起清掉，避免下次启动复活。
+        cookie_vault = Path.home() / '.xiaohongshu-cli' / 'cookies.json'
+        try:
+            if cookie_vault.is_file():
+                cookie_vault.unlink()
+                deleted.append('xiaohongshu-cookies.json')
+        except OSError:
+            pass
     if cfg['backend'] == 'biliup':
         ck = PROJECT_ROOT / 'cookies.json'
         if ck.is_file():
@@ -5488,6 +5724,69 @@ def _write_baseline_profile(name: str, form: dict) -> None:
         encoding='utf-8')
 
 
+class SessionSyncRequest(BaseModel):
+    sessions: list[dict] = Field(default_factory=list, max_length=500)
+    deleted: list[str] = Field(default_factory=list, max_length=500)
+    activeSessionId: str | None = None
+    updateActive: StrictBool = False
+
+
+class ActiveSessionRequest(BaseModel):
+    activeSessionId: str | None = None
+
+
+class DraftSaveRequest(BaseModel):
+    draft: dict
+
+
+@app.get("/api/state/sessions")
+async def api_state_sessions():
+    """跨浏览器恢复会话列表与当前会话。SQLite 是唯一真源。"""
+    try:
+        return await asyncio.to_thread(SESSION_STORE.snapshot)
+    except SessionStoreError as error:
+        raise HTTPException(400, str(error)) from error
+
+
+@app.post("/api/state/sessions/sync")
+async def api_state_sessions_sync(req: SessionSyncRequest):
+    """增量写入会话；deleted 同时生成墓碑，阻止旧浏览器把已删会话复活。"""
+    try:
+        return await asyncio.to_thread(
+            SESSION_STORE.sync,
+            req.sessions,
+            req.deleted,
+            active_session_id=req.activeSessionId,
+            update_active=bool(req.updateActive),
+        )
+    except SessionStoreError as error:
+        raise HTTPException(400, str(error)) from error
+
+
+@app.put("/api/state/active")
+async def api_state_active(req: ActiveSessionRequest):
+    try:
+        return await asyncio.to_thread(SESSION_STORE.set_active, req.activeSessionId)
+    except SessionStoreError as error:
+        raise HTTPException(400, str(error)) from error
+
+
+@app.get("/api/state/draft")
+async def api_state_draft():
+    try:
+        return await asyncio.to_thread(SESSION_STORE.draft)
+    except SessionStoreError as error:
+        raise HTTPException(400, str(error)) from error
+
+
+@app.put("/api/state/draft")
+async def api_state_draft_save(req: DraftSaveRequest):
+    try:
+        return await asyncio.to_thread(SESSION_STORE.save_draft, req.draft)
+    except SessionStoreError as error:
+        raise HTTPException(400, str(error)) from error
+
+
 @app.delete("/api/session/{session_key}")
 async def api_delete_session(session_key: str):
     """删除 OpenClaw 本地的 session 记录。"""
@@ -5530,7 +5829,277 @@ from easel.trends import management as trend_management
 from easel.trends.protocol import CollectorError as TrendCollectorError, safe_json as trend_safe_json
 from easel.trends.protocol import MAX_MANAGEMENT_BYTES
 
-_TREND_SERVICE = TrendService()
+_TREND_SERVICE = TrendService(OUTPUTS_DIR / "_trend_rate_limits.json")
+_TREND_XHS_SCOPE_COOLDOWN_SECONDS = 300
+_TREND_XHS_SWITCH_INTERVAL_SECONDS = 15
+_TREND_SCOPE_SPLIT = re.compile(r"[,，;；|\n]+")
+_TREND_SCOPE_SYNONYMS = {
+    "3c数码": ("3c", "数码", "家电", "小家电", "电器", "消费电子", "充电", "充电宝",
+              "耳机", "音箱", "键盘", "鼠标", "手机", "平板", "电脑", "投影", "相机"),
+    "加湿器": ("加湿", "湿度", "干燥", "雾化", "水箱"),
+    "手持风扇": ("小风扇", "风扇", "便携", "降温", "清凉", "挂脖"),
+}
+
+
+def _trend_scopes(scope: str | None) -> list[str]:
+    if scope is None:
+        return []
+    if len(scope) > 2048:
+        raise ValueError("范围话题查询过长")
+    scopes: list[str] = []
+    for value in _TREND_SCOPE_SPLIT.split(scope):
+        value = value.strip().lstrip("#").strip()
+        if not value:
+            continue
+        if len(value) > 40 or any(ord(char) < 32 for char in value):
+            raise ValueError("每个范围话题应为 1–40 个字符")
+        folded = value.casefold()
+        if folded not in {item.casefold() for item in scopes}:
+            scopes.append(value)
+    if len(scopes) > 8:
+        raise ValueError("一次最多筛选 8 个范围话题")
+    return sorted(scopes, key=str.casefold)
+
+
+def _trend_scope_terms(scopes: list[str]) -> set[str]:
+    terms = {scope.casefold() for scope in scopes}
+    for scope in scopes:
+        terms.update(term.casefold() for term in _TREND_SCOPE_SYNONYMS.get(scope, ()))
+    return terms
+
+
+def _filter_trend_group(group: dict, scopes: list[str], limit: int) -> dict:
+    terms = _trend_scope_terms(scopes)
+    items = [item for item in group.get("items", [])
+             if any(term in item.get("title", "").casefold() for term in terms)]
+    return {**group, "items": items[:limit]}
+
+
+def _scoped_xiaohongshu_source(source, scopes: list[str]):
+    options = dict(source.options)
+    arguments = list(options.get("args", []))
+    for scope in scopes:
+        arguments.extend(("--scope", scope))
+    return replace(source, options={**options, "args": arguments})
+
+
+def _merge_xhs_scope_groups(source, groups: list[dict], limit: int) -> dict:
+    def heat_value(item: dict) -> float:
+        heat = item.get("heat") if isinstance(item.get("heat"), dict) else {}
+        value = heat.get("value")
+        return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else -1.0
+
+    merged: dict[str, dict] = {}
+    for group in groups:
+        for item in group.get("items", []):
+            if not isinstance(item, dict):
+                continue
+            identifier = item.get("id")
+            if not isinstance(identifier, str) or not identifier:
+                continue
+            previous = merged.get(identifier)
+            if previous is None:
+                merged[identifier] = item
+                continue
+            if heat_value(item) > heat_value(previous):
+                merged[identifier] = item
+    items = sorted(
+        merged.values(),
+        key=lambda item: (-heat_value(item), str(item.get("title") or "")),
+    )[:limit]
+    errors = [group["error"] for group in groups
+              if isinstance(group.get("error"), dict)]
+    errors.sort(key=lambda error: 0 if error.get("code") in {
+        "verification_required", "ip_blocked", "login_required",
+    } else 1 if error.get("code") in {"switch_limited", "rate_limited"} else 2)
+    stale = any(group.get("stale") is True for group in groups)
+    all_ok = bool(groups) and all(group.get("ok") is True for group in groups)
+    ok = bool(items) or all_ok
+    error = None
+    if errors:
+        primary = errors[0]
+        code = primary.get("code") if isinstance(primary.get("code"), str) else "collector_failed"
+        message = primary.get("message") if isinstance(primary.get("message"), str) else "部分范围采集失败"
+        if len(errors) > 1:
+            message = f"{message}（{len(errors)} 个范围未全部完成）"
+        error = {"code": code, "message": message}
+        if (isinstance(primary.get("retry_after"), (int, float))
+                and not isinstance(primary.get("retry_after"), bool)):
+            error["retry_after"] = primary["retry_after"]
+    fetched = [group.get("fetched_at") for group in groups
+               if isinstance(group.get("fetched_at"), str) and group.get("fetched_at")]
+    attempts = [group.get("last_attempt_at") for group in groups
+                if isinstance(group.get("last_attempt_at"), (int, float))
+                and not isinstance(group.get("last_attempt_at"), bool)]
+    return {
+        "platform": source.id,
+        "label": groups[0].get("label", source.label) if groups else source.label,
+        "items": items,
+        "ok": ok,
+        "status": "error" if not ok else "stale" if stale or bool(errors) else "fresh",
+        "stale": bool(stale or errors) and ok,
+        "fetched_at": max(fetched) if fetched else None,
+        "last_attempt_at": int(max(attempts)) if attempts else 0,
+        "error": error,
+    }
+
+
+XHS_VERIFY_STATE = OUTPUTS_DIR / "_trends" / "xiaohongshu-verification.json"
+XHS_VERIFY_LOG = LOGIN_DIR / "xiaohongshu-verification.log"
+XHS_VERIFY_CAUSES = {"required", "blocked", "login_required"}
+XHS_VERIFY_STATES = {"idle", "required", "blocked", "login_required", "starting",
+                     "waiting", "success", "closed", "timeout", "busy", "failed"}
+_XHS_VERIFY_LOCK = threading.Lock()
+_XHS_VERIFY_PROC: subprocess.Popen | None = None
+
+
+def _read_xhs_verification() -> dict:
+    try:
+        data = json.loads(XHS_VERIFY_STATE.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict) or data.get("state") not in XHS_VERIFY_STATES:
+        return {}
+    updated = data.get("updated_at")
+    if not isinstance(updated, (int, float)) or isinstance(updated, bool) or updated < 0:
+        return {}
+    message = data.get("message")
+    if not isinstance(message, str):
+        message = ""
+    message = "".join(char for char in message if char >= " " and char != "\x7f")[:240]
+    url = data.get("url")
+    if not isinstance(url, str) or len(url) > 2048:
+        url = ""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme != "https" or parsed.hostname not in ("www.xiaohongshu.com", "xiaohongshu.com"):
+            url = ""
+    except ValueError:
+        url = ""
+    cause = data.get("cause")
+    if cause not in XHS_VERIFY_CAUSES:
+        cause = ""
+    cookies = data.get("cookies")
+    return {
+        "state": data["state"],
+        "cause": cause,
+        "message": message,
+        "url": url,
+        "updated_at": int(updated),
+        "cookies": max(0, int(cookies)) if isinstance(cookies, int) and not isinstance(cookies, bool) else 0,
+    }
+
+
+def _write_xhs_verification(state: str, message: str, *, url: str = "", cause: str = "") -> None:
+    payload = {
+        "state": state,
+        "cause": cause if cause in XHS_VERIFY_CAUSES else "",
+        "message": message[:240],
+        "url": url[:2048],
+        "updated_at": int(time.time()),
+    }
+    try:
+        XHS_VERIFY_STATE.parent.mkdir(parents=True, exist_ok=True)
+        temporary = XHS_VERIFY_STATE.with_name(
+            f"{XHS_VERIFY_STATE.name}.{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(XHS_VERIFY_STATE)
+    except OSError:
+        pass
+
+
+def _xhs_verify_running() -> bool:
+    process = _XHS_VERIFY_PROC
+    return process is not None and process.poll() is None
+
+
+def _xhs_verify_public() -> dict:
+    data = _read_xhs_verification()
+    running = _xhs_verify_running()
+    if data.get("state") in {"starting", "waiting"} and not running:
+        data = {**data, "state": "failed", "message": "验证窗口已关闭，可重新打开"}
+    return {
+        "state": data.get("state", "idle"),
+        "cause": data.get("cause", ""),
+        "message": data.get("message", ""),
+        "url": data.get("url", ""),
+        "updated_at": data.get("updated_at", 0),
+        "cookies": data.get("cookies", 0),
+        "running": running,
+    }
+
+
+def _stop_xhs_verification() -> None:
+    global _XHS_VERIFY_PROC
+    with _XHS_VERIFY_LOCK:
+        process = _XHS_VERIFY_PROC
+        _XHS_VERIFY_PROC = None
+    if process is not None and process.poll() is None:
+        try:
+            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                           timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                process.terminate()
+            except OSError:
+                pass
+
+
+def _start_xhs_verification() -> dict:
+    global _XHS_VERIFY_PROC
+    with _XHS_VERIFY_LOCK:
+        if _xhs_verify_running():
+            return _xhs_verify_public()
+        data = _read_xhs_verification()
+        cause = data.get("cause") or data.get("state")
+        if cause not in XHS_VERIFY_CAUSES:
+            cause = "required"
+        url = data.get("url") or "https://www.xiaohongshu.com/explore"
+        _write_xhs_verification("starting", "正在打开小红书验证窗口", url=url, cause=cause)
+        command = [
+            sys.executable, str(SHARED_SCRIPTS / "xhs_verify.py"),
+            "--status-file", str(XHS_VERIFY_STATE),
+            "--url", url,
+            "--timeout", "600",
+        ]
+        proxy = (os.environ.get("EASEL_PROXY") or os.environ.get("https_proxy")
+                 or os.environ.get("HTTPS_PROXY") or "")
+        if proxy:
+            command.extend(["--proxy", proxy])
+        else:
+            command.append("--no-proxy")
+        environment = os.environ.copy()
+        environment.update(PYTHONUTF8="1", PYTHONIOENCODING="utf-8", NO_COLOR="1")
+        XHS_VERIFY_LOG.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with XHS_VERIFY_LOG.open("a", encoding="utf-8") as log:
+                process = subprocess.Popen(
+                    command, cwd=str(PROJECT_ROOT), env=environment,
+                    stdin=subprocess.DEVNULL, stdout=log, stderr=log, shell=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except OSError:
+            _write_xhs_verification("failed", "验证窗口启动失败，请查看日志后重试",
+                                    url=url, cause=cause)
+            return _xhs_verify_public()
+        _XHS_VERIFY_PROC = process
+        return _xhs_verify_public()
+
+
+def _xhs_verification_group(group: dict, verification: dict) -> dict:
+    cause = verification.get("cause") or verification.get("state")
+    details = {
+        "required": ("verification_required",
+                     "小红书触发安全验证，已打开浏览器窗口，请完成验证后点击「重新获取」。"),
+        "blocked": ("ip_blocked",
+                    "小红书当前限制了本机网络，已打开浏览器窗口，请切换网络后重试。"),
+        "login_required": ("login_required",
+                           "小红书登录态已失效，已打开浏览器窗口，请重新登录后重试。"),
+    }
+    code, message = details.get(cause, details["required"])
+    return {**group, "ok": False, "status": "error", "stale": False,
+            "error": {"code": code, "message": message}}
 
 
 def _trend_registry():
@@ -5591,19 +6160,107 @@ async def api_trend_manage_write(request: Request):
 
 
 @app.get("/api/trends")
-async def api_trends(platforms: str | None = None, limit: int = 12):
+async def api_trends(platforms: str | None = None, scope: str | None = None, limit: int = 12):
     if platforms is not None and len(platforms) > 8192:
         raise HTTPException(400, "数据源查询过长")
+    try:
+        scopes = _trend_scopes(scope)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from None
     sources, environment, warnings = _trend_registry()
     registry = {source.id: source for source in sources}
     selected = ([source.id for source in sources if source.default] if platforms is None else
                 list(dict.fromkeys(p.strip() for p in platforms.split(",") if p.strip() in registry)))
-    results = await asyncio.gather(*(
-        asyncio.to_thread(_TREND_SERVICE.get, registry[identifier], environment, max(1, min(limit, 30)))
-        for identifier in selected), return_exceptions=True)
+    display_limit = max(1, min(limit, 30))
+    fetch_limit = min(60, max(display_limit, display_limit * 3)) if scopes else display_limit
+
+    def with_xhs_verification(result: dict) -> dict:
+        if result.get("ok"):
+            return result
+        verification = _read_xhs_verification()
+        if (verification.get("state") in {"required", "starting", "waiting",
+                                          "blocked", "login_required"}
+                and time.time() - verification.get("updated_at", 0) <= 600):
+            result = _xhs_verification_group(result, verification)
+            if verification.get("state") in XHS_VERIFY_CAUSES:
+                try:
+                    _start_xhs_verification()
+                except Exception:
+                    pass
+        return result
+
+    async def get_xhs_group(source, cooldown_key: str):
+        last = None
+        for _ in range(3):
+            last = await asyncio.to_thread(
+                _TREND_SERVICE.get, source, environment, fetch_limit,
+                _TREND_XHS_SCOPE_COOLDOWN_SECONDS, cooldown_key,
+                _TREND_XHS_SWITCH_INTERVAL_SECONDS)
+            last = with_xhs_verification(last)
+            error = last.get("error") if isinstance(last.get("error"), dict) else {}
+            retry_after = error.get("retry_after")
+            if (error.get("code") != "switch_limited"
+                    or not isinstance(retry_after, (int, float))
+                    or isinstance(retry_after, bool) or retry_after <= 0):
+                return last
+            await asyncio.sleep(min(float(retry_after) + 0.05, 16))
+        return last
+
+    async def collect_scoped_xhs(source):
+        groups = []
+        for one_scope in scopes:
+            scoped_source = _scoped_xiaohongshu_source(source, [one_scope])
+            result = await get_xhs_group(scoped_source, one_scope.casefold())
+            groups.append(result)
+            error = result.get("error") if isinstance(result.get("error"), dict) else {}
+            if error.get("code") in {"verification_required", "ip_blocked", "login_required"}:
+                break
+        return _merge_xhs_scope_groups(source, groups, display_limit)
+
+    async def collect_group(identifier: str):
+        source = registry[identifier]
+        scoped_xhs = bool(scopes) and identifier == "xiaohongshu" and source.type == "python"
+        if scoped_xhs:
+            result = await collect_scoped_xhs(source)
+            return {**result, "items": result.get("items", [])[:display_limit]}
+        if identifier == "xiaohongshu" and source.type == "python":
+            result = await get_xhs_group(source, "__hot__")
+        else:
+            result = await asyncio.to_thread(
+                _TREND_SERVICE.get, source, environment, fetch_limit)
+        if scopes and not scoped_xhs:
+            return _filter_trend_group(result, scopes, display_limit)
+        return {**result, "items": result.get("items", [])[:display_limit]}
+
+    results = await asyncio.gather(*(collect_group(identifier) for identifier in selected),
+                                   return_exceptions=True)
     groups = [result if isinstance(result, dict) else trend_failure_group(registry[identifier])
               for identifier, result in zip(selected, results)]
     return {"version": 1, "trends": groups, "updated": int(time.time()), "warnings": warnings}
+
+
+@app.get("/api/trends/xhs/verify")
+async def api_xhs_verify_status(request: Request):
+    _trend_manager_guard(request)
+    return await asyncio.to_thread(_xhs_verify_public)
+
+
+@app.post("/api/trends/xhs/verify/start")
+async def api_xhs_verify_start(request: Request):
+    _trend_manager_guard(request)
+    return await asyncio.to_thread(_start_xhs_verification)
+
+
+@app.post("/api/trends/xhs/verify/retry")
+async def api_xhs_verify_retry(request: Request):
+    _trend_manager_guard(request)
+    await asyncio.to_thread(_stop_xhs_verification)
+    _TREND_SERVICE.reset("xiaohongshu")
+    try:
+        XHS_VERIFY_STATE.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return {"ok": True}
 
 
 SCHEDULE_FILE = OUTPUTS_DIR / "_schedule.json"

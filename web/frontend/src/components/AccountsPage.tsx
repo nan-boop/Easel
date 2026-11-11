@@ -399,7 +399,7 @@ export default function AccountsPage() {
         </div>
         <button className="btn btn-sm" onClick={load}><IconRefresh size={14} /> 刷新</button>
       </div>
-      <div className="accounts-notice">按平台通过扫码或浏览器窗口登录，登录状态保存在本地。若登录页面无法显示，请检查网络或代理环境。</div>
+      <div className="accounts-notice">按平台通过扫码或浏览器窗口登录；登录态保存在运行 Easel 的这台电脑上，同一服务下的 Edge、Ego 等浏览器共用。若登录页面无法显示，请检查网络或代理环境。</div>
 
       {err && <div style={{ color: 'var(--red)', fontSize: 13, marginTop: 12 }}>{err}</div>}
       {terminalMsg && (

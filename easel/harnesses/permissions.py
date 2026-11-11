@@ -1,4 +1,4 @@
-"""Conservative automatic approval of ordinary Codex requests."""
+"""Automatic approval policy for Codex execution requests."""
 from __future__ import annotations
 
 import re
@@ -20,6 +20,8 @@ def _inside_workspace(value: str, root: Path) -> bool:
 
 
 def can_auto_approve(method: str, params: dict, request: RunRequest) -> bool:
+    if request.sandbox == "danger-full-access":
+        return True
     if not request.codex_auto_approve:
         return False
     if method == "item/fileChange/requestApproval":

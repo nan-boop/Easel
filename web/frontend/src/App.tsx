@@ -15,6 +15,7 @@ import BreakdownPage from './components/BreakdownPage';
 import SubNav from './components/SubNav';
 import OnboardingWizard from './components/OnboardingWizard';
 import SettingsPanel from './components/SettingsPanel';
+import XhsVerifyDialog from './components/XhsVerifyDialog';
 import { fetchStatus, fetchPersonas, streamChat, fetchLastTurn, stopChat } from './lib/api';
 import type { PersonaItem, UploadedFile, ChatQuestion } from './lib/api';
 import { availablePersona, parsePersonas } from './lib/personas';
@@ -23,6 +24,7 @@ import { deleteSession as deleteRemoteSession } from './lib/api';
 import {
   loadSessions,
   saveSessions,
+  hydrateSessions,
   createSession,
   updateSessionTitle,
   loadActiveId,
@@ -71,10 +73,19 @@ export default function App() {
   // 装完还没配模型时，首开要把用户直接带到模型设置页（安装脚本不再在终端问 Key）
   const [needModelSetup, setNeedModelSetup] = useState(false);
   const [sessionSaveError, setSessionSaveError] = useState(false);
+  const [sessionSyncError, setSessionSyncError] = useState(false);
   useEffect(() => {
     const onSaveError = () => setSessionSaveError(true);
+    const onSyncError = () => setSessionSyncError(true);
+    const onSyncOk = () => setSessionSyncError(false);
     window.addEventListener('easel-session-save-error', onSaveError);
-    return () => window.removeEventListener('easel-session-save-error', onSaveError);
+    window.addEventListener('easel-session-sync-error', onSyncError);
+    window.addEventListener('easel-session-sync-ok', onSyncOk);
+    return () => {
+      window.removeEventListener('easel-session-save-error', onSaveError);
+      window.removeEventListener('easel-session-sync-error', onSyncError);
+      window.removeEventListener('easel-session-sync-ok', onSyncOk);
+    };
   }, []);
 
   // 对话里的「产物路径 → 内容库」跳转：linkifyOutputs 把目录路径生成为
@@ -104,11 +115,12 @@ export default function App() {
   //  - 否则续上上次会话（保留「关页重开续接」的体验）。
   const TAB_SESSION_KEY = 'easel_tab_session';
   useEffect(() => {
-    const existing = loadSessions();
+    let disposed = false;
     let ch: BroadcastChannel | null = null;
     try { ch = new BroadcastChannel('easel-session'); } catch { ch = null; }
 
     const settle = (id: string, sess: ChatSession[]) => {
+      if (disposed) return;
       setSessions(sess);
       setActiveSessionId(id);
       const s = sess.find((x) => x.id === id);
@@ -117,6 +129,7 @@ export default function App() {
       ch?.postMessage({ type: 'claim', sessionId: id });
     };
     const openNew = (sess: ChatSession[]) => {
+      if (disposed) return;
       const ns = createSession();
       const updated = [ns, ...sess];
       saveSessions(updated);
@@ -132,42 +145,56 @@ export default function App() {
     };
     ch?.addEventListener('message', onMsg);
 
-    // 1) 本标签刷新：续本标签原会话
-    let tabOwn: string | null = null;
-    try { tabOwn = sessionStorage.getItem(TAB_SESSION_KEY); } catch { tabOwn = null; }
-    if (tabOwn && existing.find((s) => s.id === tabOwn)) {
-      settle(tabOwn, existing);
-      return () => { ch?.removeEventListener('message', onMsg); ch?.close(); };
-    }
+    void (async () => {
+      const hydrated = await hydrateSessions(loadSessions());
+      if (disposed) return;
+      const existing = hydrated.sessions;
 
-    // 2) 新标签：候选=上次活跃会话；先跨标签问有没有别的活标签占着它
-    const lastId = loadActiveId();
-    const candidate = lastId && existing.find((s) => s.id === lastId) ? lastId : null;
-    if (candidate && ch) {
-      let taken = false;
-      const probe = (e: MessageEvent) => {
-        const d = e.data as { type?: string; sessionId?: string } | null;
-        if (d?.type === 'owned' && d.sessionId === candidate) taken = true;
-      };
-      ch.addEventListener('message', probe);
-      ch.postMessage({ type: 'query', sessionId: candidate });
-      const t = setTimeout(() => {
-        ch?.removeEventListener('message', probe);
-        if (taken) openNew(existing);      // 另一个窗口在用 → 开新会话
-        else settle(candidate, existing);  // 没人占 → 续上
-      }, 250);
-      return () => { clearTimeout(t); ch?.removeEventListener('message', probe); ch?.removeEventListener('message', onMsg); ch?.close(); };
-    }
+      // 1) 本标签刷新：续本标签原会话
+      let tabOwn: string | null = null;
+      try { tabOwn = sessionStorage.getItem(TAB_SESSION_KEY); } catch { tabOwn = null; }
+      if (tabOwn && existing.find((s) => s.id === tabOwn)) {
+        settle(tabOwn, existing);
+        return;
+      }
 
-    // 3) 无候选 / 不支持 BroadcastChannel：退化为原逻辑（复用空会话或新建；后端 flock 兜底防崩）
-    if (candidate) {
-      settle(candidate, existing);
-    } else {
-      const empty = existing.find((s) => s.messages.length === 0);
-      if (empty) settle(empty.id, existing);
-      else openNew(existing);
-    }
-    return () => { ch?.removeEventListener('message', onMsg); ch?.close(); };
+      // 2) 新标签：候选=服务端上次活跃会话（兼容旧版本地缓存）；先问有没有别的活标签占着它
+      const lastId = hydrated.activeSessionId || loadActiveId();
+      const candidate = lastId && existing.find((s) => s.id === lastId) ? lastId : null;
+      if (candidate && ch) {
+        let taken = false;
+        const probe = (e: MessageEvent) => {
+          const d = e.data as { type?: string; sessionId?: string } | null;
+          if (d?.type === 'owned' && d.sessionId === candidate) taken = true;
+        };
+        ch.addEventListener('message', probe);
+        ch.postMessage({ type: 'query', sessionId: candidate });
+        setTimeout(() => {
+          ch?.removeEventListener('message', probe);
+          if (disposed) return;
+          if (taken) openNew(existing);      // 另一个窗口在用 → 开新会话
+          else settle(candidate, existing);  // 没人占 → 续上
+        }, 250);
+        return;
+      }
+
+      // 3) 无候选 / 不支持 BroadcastChannel：优先恢复最近的非空会话，再复用空会话。
+      if (candidate) {
+        settle(candidate, existing);
+      } else {
+        const recent = existing.find((s) => !s.archived && s.messages.length > 0);
+        const empty = existing.find((s) => s.messages.length === 0);
+        if (recent) settle(recent.id, existing);
+        else if (empty) settle(empty.id, existing);
+        else openNew(existing);
+      }
+    })();
+
+    return () => {
+      disposed = true;
+      ch?.removeEventListener('message', onMsg);
+      ch?.close();
+    };
   }, []);
 
   // 持久化当前活跃会话 id，重开网页据此续接上次对话（修复"今天再问就忘了"）。
@@ -844,7 +871,19 @@ export default function App() {
         onOpenSettings={() => setSettingsOpen(true)}
       />
       <main className="main-content">
-        {sessionSaveError && <div className="notice-error" role="alert">会话未能写入浏览器存储，内容仍保留在当前页面。请检查存储空间或权限。<button className="btn btn-sm" onClick={() => setSessionSaveError(false)}>关闭提示</button></div>}
+        {(sessionSaveError || sessionSyncError) && (
+          <div className="notice-error" role="alert">
+            {sessionSaveError
+              ? '本地缓存写入失败，内容仍保留在当前页面；请检查浏览器存储空间或权限。'
+              : '会话暂未同步到服务端，当前内容已保存在本浏览器，系统会自动重试。'}
+            <button
+              className="btn btn-sm"
+              onClick={() => { setSessionSaveError(false); setSessionSyncError(false); }}
+            >
+              关闭提示
+            </button>
+          </div>
+        )}
         {(['trends', 'ideas', 'calendar', 'publish', 'breakdown'] as Page[]).includes(currentPage) && (
           <SubNav current={currentPage} onNavigate={setCurrentPage} />
         )}
@@ -893,6 +932,8 @@ export default function App() {
           }}
         />
       )}
+
+      <XhsVerifyDialog onNavigate={setCurrentPage} />
     </div>
   );
 }

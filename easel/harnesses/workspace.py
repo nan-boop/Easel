@@ -23,6 +23,12 @@ def harness_instructions(request: RunRequest) -> str:
     root = request.cwd.resolve()
     python = root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     runtime = request.env.get("EASEL_AGENT_RUNTIME", "当前所选引擎")
+    permission_text = (
+        "当前为完全访问模式：本机执行工具已由用户授权，不再逐次请求技术权限；"
+        "但不得借此读取或外传与任务无关的私密文件。"
+        if request.sandbox == "danger-full-access"
+        else "额外工具权限必须由用户确认，不得绕过权限限制。"
+    )
     documents = "\n\n".join(
         f"## 共享工作区：{document.name}\n\n{document.read_text(encoding='utf-8')}"
         for document in workspace_documents(root))
@@ -38,5 +44,6 @@ def harness_instructions(request: RunRequest) -> str:
         "easel-profiles/ 仅在另有工作区链接时可用，不是项目根中的必需目录。"
         "遵循用户选择的画像和每轮技能提醒。配置检查只使用项目 .env 的脱敏结果，不回显凭证。"
         "公开发布、修改账号状态和其它不可逆操作必须先取得明确同意。"
-        "不要泄露凭证、私有配置或内部地址。额外工具权限必须由用户确认，不得绕过权限限制。"
+        "不要泄露凭证、私有配置或内部地址。"
+        + permission_text
     )

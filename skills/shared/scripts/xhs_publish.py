@@ -90,6 +90,8 @@ SELECTORS = {
 PROFILE_NAME = "XiaohongshuProfile"
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_QR_OUT = PROJECT_ROOT / "outputs" / "_login" / "xhs-login-qrcode.png"
+CLI_COOKIE_PATH = Path.home() / ".xiaohongshu-cli" / "cookies.json"
+COOKIE_NAME = re.compile(r"[A-Za-z0-9_.-]{1,128}")
 
 # Chromium 启动性能参数（提速冷启动；勿禁用图片——二维码是图片）
 LAUNCH_ARGS = [
@@ -140,6 +142,81 @@ def _abspaths(csv: str | None) -> list[str]:
 def _profile_dir(base: str | None) -> Path:
     root = Path(base).expanduser() if base else Path.home() / ".easel-browser-profiles"
     return root / PROFILE_NAME
+
+
+def _read_cli_cookies() -> dict[str, str]:
+    """读取本地登录会话文件。
+
+    Playwright 的持久化 Profile 不是绝对可靠：浏览器被强制关闭、内核升级或
+    页面风控跳转时，Cookie 可能来不及落盘。这里保留一份独立 JSON 会话作为
+    服务端登录态的第二副本，每次启动时回灌，避免 Edge / Ego 看起来“没同步”。
+    """
+    try:
+        data = json.loads(CLI_COOKIE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        key: value for key, value in data.items()
+        if isinstance(key, str) and key != "saved_at"
+        and isinstance(value, str) and COOKIE_NAME.fullmatch(key)
+    }
+
+
+def _inject_cli_cookies(context) -> int:
+    saved = _read_cli_cookies()
+    if not saved:
+        return 0
+    context.add_cookies([{
+        "name": name,
+        "value": value,
+        "domain": ".xiaohongshu.com",
+        "path": "/",
+        "expires": -1,
+        "httpOnly": False,
+        "secure": True,
+        "sameSite": "Lax",
+    } for name, value in saved.items()])
+    return len(saved)
+
+
+def _sync_cli_cookies(context) -> int:
+    """把浏览器里确认可用的登录 Cookie 写回独立会话文件。
+
+    只有出现小红书登录 Cookie 时才写，避免把匿名风控页的 Cookie 覆盖掉
+    一份原本有效的登录态。
+    """
+    current = _read_cli_cookies()
+    rows = []
+    for cookie in context.cookies():
+        domain = cookie.get("domain")
+        name = cookie.get("name")
+        value = cookie.get("value")
+        if not isinstance(domain, str) or "xiaohongshu.com" not in domain:
+            continue
+        if not isinstance(name, str) or not COOKIE_NAME.fullmatch(name):
+            continue
+        if not isinstance(value, str):
+            continue
+        rows.append((name, value))
+    names = {name for name, _ in rows}
+    if not names.intersection(("web_session", "id_token")):
+        return 0
+    changed = 0
+    for name, value in rows:
+        if current.get(name) != value:
+            current[name] = value
+            changed += 1
+    current["saved_at"] = int(time.time())
+    try:
+        CLI_COOKIE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporary = CLI_COOKIE_PATH.with_name(f"{CLI_COOKIE_PATH.name}.{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(current, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(CLI_COOKIE_PATH)
+    except OSError:
+        return 0
+    return changed
 
 
 def _cloak_executable() -> Path | None:
@@ -1020,6 +1097,7 @@ def _launch(p, headed: bool, base: str | None, proxy: str | None, *, login_asset
     for attempt in range(2):
         try:
             context = p.chromium.launch_persistent_context(str(profile), **kwargs)
+            _inject_cli_cookies(context)
             if login_assets:
                 login_transport.install(context, "xiaohongshu")
             return context
@@ -1115,6 +1193,7 @@ def cmd_login(a) -> int:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             try:
                 if _creator_account(ctx) is not None:
+                    _sync_cli_cookies(ctx)
                     login_state.write_status(sf, "success", "已登录")
                     print("✅ 已登录（创作平台账号接口已确认），无需扫码")
                     return 0
@@ -1142,6 +1221,7 @@ def cmd_login(a) -> int:
                         pass
 
                 if _is_logged_in(page):
+                    _sync_cli_cookies(ctx)
                     login_state.write_status(sf, "success", "已登录")
                     print("✅ 已登录（cookie 已在持久化目录），无需扫码")
                     return 0
@@ -1198,6 +1278,7 @@ def cmd_login(a) -> int:
                         logged_in = _creator_account(ctx) is not None
                         next_account_check = time.monotonic() + 5
                     if logged_in:
+                        _sync_cli_cookies(ctx)
                         login_state.write_status(sf, "success", "登录成功")
                         print("✅ 登录成功，cookie 已持久化，下次免登")
                         try:
@@ -1399,11 +1480,13 @@ def cmd_whoami(a) -> int:
                                     result[field] = fallback[field]
                         except Exception:
                             pass
+                    _sync_cli_cookies(ctx)
                 else:
                     logged = _check_account_login(page)
                     result["loggedIn"] = logged
                     if logged:
                         result.update(_page_account_identity(page))
+                        _sync_cli_cookies(ctx)
             finally:
                 ctx.close()
     except Exception as e:  # noqa: BLE001 — whoami 永远输出 JSON，异常视作未登录

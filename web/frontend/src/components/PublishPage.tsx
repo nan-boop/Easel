@@ -4,7 +4,7 @@ import {
   fetchAccounts, publishNow, publishStatus, submitPublishSms, fetchOutputs, mediaUrl,
 } from '../lib/api';
 import type { AccountItem, OutputFile } from '../lib/api';
-import { loadPublishDraft, savePublishDraft } from '../lib/store';
+import { hydratePublishDraft, loadPublishDraft, savePublishDraft } from '../lib/store';
 import { renderMarkdown } from '../lib/sanitize';
 import { IconPublish, IconCopy, IconCheck, IconCalendar, IconSkills, IconEdit, IconStop, IconTrash } from './icons';
 
@@ -77,7 +77,21 @@ export default function PublishPage({ persona }: PublishPageProps) {
   const [pubSmsCode, setPubSmsCode] = useState('');
   const [pubSmsBusy, setPubSmsBusy] = useState(false);
 
-  // 草稿持久化：任何改动即写 localStorage，切页/刷新回来都在
+  // 草稿以服务端 SQLite 为真源；本地缓存先渲染，服务端较新时回填。
+  useEffect(() => {
+    let active = true;
+    void hydratePublishDraft(draft0).then((remote) => {
+      if (!active || (remote.updatedAt || 0) <= (draft0.updatedAt || 0)) return;
+      setTitle((prev) => prev === draft0.title ? remote.title : prev);
+      setBody((prev) => prev === draft0.body ? remote.body : prev);
+      setPlatforms((prev) => prev.join('|') === draft0.platforms.join('|') ? remote.platforms : prev);
+      setOverrides((prev) => JSON.stringify(prev) === JSON.stringify(draft0.overrides) ? remote.overrides : prev);
+      setTags((prev) => prev === draft0.tags ? remote.tags : prev);
+    });
+    return () => { active = false; };
+  }, []);
+
+  // 草稿持久化：本地立即写缓存，服务端防抖同步；切页/刷新/换浏览器都能恢复。
   useEffect(() => {
     savePublishDraft({ title, body, platforms, overrides, tags });
   }, [title, body, platforms, overrides, tags]);

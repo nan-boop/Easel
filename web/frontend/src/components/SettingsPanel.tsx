@@ -3,6 +3,7 @@ import type { Dispatch, SetStateAction } from 'react';
 import EnvBoard from './EnvBoard';
 import HarnessSettings from './HarnessSettings';
 import SettingsSelect, { OptionsDropdown } from './SettingsSelect';
+import UpdatePanel from './UpdatePanel';
 import type { JobView } from './EnvBoard';
 import {
   fetchEnvTools, startEnvInstall, fetchEnvJob,
@@ -11,7 +12,7 @@ import {
   fetchProxySettings, saveProxySettings,
 } from '../lib/api';
 import type { EnvTool, ModelRow, SelftestResult, LocalAgentInfo, ProxySettings } from '../lib/api';
-import { IconSlidersHorizontal, IconPackage, IconEllipsis } from './settingsIcons';
+import { IconSlidersHorizontal, IconPackage, IconEllipsis, IconRefreshCw } from './settingsIcons';
 
 interface Props {
   onClose: () => void;
@@ -19,7 +20,7 @@ interface Props {
   banner?: string;
 }
 
-type Sec = 'model' | 'env' | 'more';
+type Sec = 'model' | 'env' | 'update' | 'more';
 type Chan = 'chat' | 'transcribe' | 'speech' | 'image' | 'video' | 'music';
 
 const CHANNELS: { id: Chan; label: string }[] = [
@@ -701,7 +702,7 @@ export default function SettingsPanel({ onClose, banner = '' }: Props) {
         <div className="settings-head">
           <div>
             <h2 className="settings-title">设置</h2>
-            <div className="settings-sub">模型配置 · 环境安装 · 更多设置</div>
+            <div className="settings-sub">模型配置 · 环境安装 · 系统更新 · 更多设置</div>
           </div>
           <div className="settings-actions">
             <button
@@ -744,6 +745,9 @@ export default function SettingsPanel({ onClose, banner = '' }: Props) {
             </button>
             <button className={`snav${sec === 'env' ? ' active' : ''}`} onClick={() => setSec('env')}>
               <IconPackage size={16} />环境安装<small>{total ? (okCount === total ? '全就绪' : `${okCount}/${total}`) : '…'}</small>
+            </button>
+            <button className={`snav${sec === 'update' ? ' active' : ''}`} onClick={() => setSec('update')}>
+              <IconRefreshCw size={16} />系统更新
             </button>
             <button className={`snav${sec === 'more' ? ' active' : ''}`} onClick={() => setSec('more')}>
               <IconEllipsis size={16} />更多设置
@@ -906,6 +910,8 @@ export default function SettingsPanel({ onClose, banner = '' }: Props) {
                 />
               </section>
             )}
+
+            {sec === 'update' && <UpdatePanel />}
 
             {sec === 'more' && (
               <section className="st-sec active">

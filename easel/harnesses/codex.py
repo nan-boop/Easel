@@ -2,22 +2,38 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 
 from easel import __version__
 
+from . import store as harness_store
 from .base import Descriptor, HarnessError, RunRequest
 from .commands import base_command
 from .permissions import can_auto_approve
 from .rpc import connection
 from .workspace import harness_instructions
 
+FULL_ACCESS_OPTION = "完全访问（以后不再询问）"
+
+
+def _enable_full_access(request: RunRequest) -> None:
+    config = harness_store.settings(request.cwd / "outputs", request.env)
+    config["runtime"] = "codex"
+    config["sandbox"] = "danger-full-access"
+    config["codex_auto_approve"] = True
+    harness_store.write_json(
+        request.cwd / "outputs" / "_harness" / "config.json", config)
+
 
 class CodexAdapter:
     descriptor = Descriptor("codex", "Codex", "app-server", "npm install -g @openai/codex；codex login")
 
     async def run(self, request: RunRequest, emit, ask, bind):
-        if request.sandbox not in ("read-only", "workspace-write"):
-            raise HarnessError("Codex 只允许只读或工作区写入权限")
+        if request.sandbox not in ("read-only", "workspace-write", "danger-full-access"):
+            raise HarnessError("Codex 权限设置无效，请选择只读、工作区写入或完全访问")
+        full_access = request.sandbox == "danger-full-access"
+        effective_auto_approve = request.codex_auto_approve
+        approval_policy = "never" if full_access else "on-request"
         completion = asyncio.get_running_loop().create_future()
         thread_id = request.native_id
         turn_id = ""
@@ -68,21 +84,60 @@ class CodexAdapter:
                         str(error.get("message") or f"Codex 本轮未完成：{turn.get('status')}")))
 
         async def respond(method, params):
+            nonlocal full_access, effective_auto_approve
             if params.get("threadId") != thread_id or (
                     turn_id and params.get("turnId", turn_id) != turn_id):
                 raise HarnessError("不属于当前会话的请求")
             if method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
-                if can_auto_approve(method, params, request):
-                    emit("activity", "Codex：已自动通过普通操作授权")
+                # 设置保存后立即生效：同一轮对话里的后续授权也必须重新读取本机策略，
+                # 不能继续使用本轮启动时冻结的旧权限。
+                try:
+                    live = harness_store.settings(request.cwd / "outputs", request.env)
+                except Exception:
+                    live = {}
+                if live.get("sandbox") == "danger-full-access":
+                    full_access = True
+                    effective_auto_approve = True
+                elif not full_access:
+                    effective_auto_approve = live.get(
+                        "codex_auto_approve", effective_auto_approve)
+                effective_request = replace(
+                    request,
+                    sandbox="danger-full-access" if full_access else request.sandbox,
+                    codex_auto_approve=effective_auto_approve,
+                )
+                if can_auto_approve(method, params, effective_request):
+                    emit("activity", "Codex：完全访问模式已自动授权"
+                         if full_access else "Codex：已自动通过普通操作授权")
                     return {"decision": "accept"}
                 detail = params.get("command") or params.get("reason") or params.get("itemId", "")
+                risk_note = ("\n此操作不属于可自动批准的普通操作，请确认风险。"
+                             if effective_auto_approve else "")
                 answers = await ask([{
                     "questionId": "permission", "header": "执行授权",
-                    "question": f"Codex 请求额外权限（仅本次）：{str(detail)[:3000]}" + (
-                        "\n此操作不属于可自动批准的普通操作，请确认风险。" if request.codex_auto_approve else ""),
-                    "options": [{"label": "允许本次"}, {"label": "拒绝"}],
+                    "question": f"Codex 请求执行权限：{str(detail)[:3000]}{risk_note}"
+                        "\n选择「完全访问」会把权限保存到本机，后续 Codex 对话不再逐次询问。",
+                    "options": [
+                        {"label": "允许本次"},
+                        {"label": FULL_ACCESS_OPTION,
+                         "description": "点击即启用：允许读写全机并运行命令；当前及后续对话不再弹出执行授权"},
+                        {"label": "拒绝"},
+                    ],
                 }])
-                return {"decision": "accept" if answers.get("permission") == ["允许本次"] else "decline"}
+                choice = (answers.get("permission") or [""])[0]
+                if choice == FULL_ACCESS_OPTION:
+                    try:
+                        _enable_full_access(request)
+                    except Exception:
+                        full_access = True
+                        effective_auto_approve = True
+                        emit("activity", "Codex：完全访问设置保存失败；当前对话已临时切换为自动授权")
+                    else:
+                        full_access = True
+                        effective_auto_approve = True
+                        emit("activity", "Codex：已切换为完全访问，后续执行将自动授权")
+                    return {"decision": "accept"}
+                return {"decision": "accept" if choice == "允许本次" else "decline"}
             if method == "item/tool/requestUserInput":
                 questions = params.get("questions") or []
                 if any(question.get("isSecret") for question in questions):
@@ -99,7 +154,7 @@ class CodexAdapter:
                     "clientInfo": {"name": "easel", "version": __version__},
                     "capabilities": {"experimentalApi": True}})
                 await rpc.send({"method": "initialized"})
-            options = {"cwd": str(request.cwd), "approvalPolicy": "on-request",
+            options = {"cwd": str(request.cwd), "approvalPolicy": approval_policy,
                        "sandbox": request.sandbox,
                        "developerInstructions": harness_instructions(request)}
             if request.model:
@@ -118,11 +173,12 @@ class CodexAdapter:
                 raise HarnessError("Codex 未返回原生会话 ID")
             bind(thread_id)
             rpc.native_id = thread_id
-            policy = {"type": "readOnly"} if request.sandbox == "read-only" else {
-                "type": "workspaceWrite", "writableRoots": [str(request.cwd)],
-                "networkAccess": False}
+            policy = ({"type": "dangerFullAccess"} if full_access
+                      else {"type": "readOnly"} if request.sandbox == "read-only"
+                      else {"type": "workspaceWrite", "writableRoots": [str(request.cwd)],
+                            "networkAccess": False})
             params = {"threadId": thread_id, "input": [{"type": "text", "text": request.prompt}],
-                      "approvalPolicy": "on-request", "sandboxPolicy": policy}
+                      "approvalPolicy": approval_policy, "sandboxPolicy": policy}
             if request.model:
                 params["model"] = request.model
             early: list[tuple[str, dict]] = []

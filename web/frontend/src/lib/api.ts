@@ -1,4 +1,5 @@
 import { parsePersonas } from './personas';
+import type { ChatSession, PublishDraft } from './store';
 
 function getBasePath(): string {
   const path = window.location.pathname;
@@ -267,7 +268,7 @@ export interface TrendItem {
 export interface TrendGroup {
   platform: string; label: string; items: TrendItem[]; ok: boolean;
   status: 'fresh' | 'stale' | 'error'; stale: boolean; fetched_at: string | null;
-  last_attempt_at: number; error: { code: string; message: string } | null;
+  last_attempt_at: number; error: { code: string; message: string; retry_after?: number } | null;
 }
 export interface TrendSource {
   id: string; label: string; type: 'python' | 'http' | 'rss'; default: boolean; refresh_seconds: number;
@@ -275,8 +276,37 @@ export interface TrendSource {
 export function fetchTrendSources() {
   return trendRequest('/api/trends/sources').then(parseTrendSources);
 }
-export function fetchTrends(platforms?: string, limit = 12) {
-  return trendRequest(`/api/trends?limit=${limit}${platforms === undefined ? '' : `&platforms=${encodeURIComponent(platforms)}`}`, {}, 130000).then(parseTrends);
+export function fetchTrends(platforms?: string, limit = 12, scope = '') {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (platforms !== undefined) params.set('platforms', platforms);
+  if (scope.trim()) params.set('scope', scope.trim());
+  return trendRequest(`/api/trends?${params.toString()}`, {}, 240000).then(parseTrends).then((data) => {
+    const hit = data.trends.find((group) => group.error
+      && ['verification_required', 'ip_blocked', 'login_required'].includes(group.error.code));
+    if (hit?.error) {
+      window.dispatchEvent(new CustomEvent('easel:xhs-verify', { detail: hit.error }));
+    }
+    return data;
+  });
+}
+export interface XhsVerifyStatus {
+  state: 'idle' | 'required' | 'blocked' | 'login_required' | 'starting' | 'waiting'
+    | 'success' | 'closed' | 'timeout' | 'busy' | 'failed';
+  cause: 'required' | 'blocked' | 'login_required' | '';
+  message: string;
+  url: string;
+  updated_at: number;
+  cookies: number;
+  running: boolean;
+}
+export function fetchXhsVerifyStatus(): Promise<XhsVerifyStatus> {
+  return request<XhsVerifyStatus>('/api/trends/xhs/verify');
+}
+export function startXhsVerify(): Promise<XhsVerifyStatus> {
+  return request<XhsVerifyStatus>('/api/trends/xhs/verify/start', { method: 'POST' });
+}
+export function retryXhsTrends(): Promise<{ ok: boolean }> {
+  return request<{ ok: boolean }>('/api/trends/xhs/verify/retry', { method: 'POST' });
 }
 export interface TrendManagedSource {
   id: string; label: string; type: TrendSource['type'] | 'unknown'; enabled: boolean; default: boolean; builtin: boolean;
@@ -377,6 +407,46 @@ export function runAgent(message: string, persona?: string): Promise<{ response:
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ message, persona: persona || undefined }),
+  });
+}
+
+export interface BreakdownNote {
+  title: string;
+  author: string;
+  desc: string;
+  tags: string[];
+  published_at: string;
+  likes: string;
+  collects: string;
+  comments: string;
+  shares: string;
+  image_count: number;
+  url: string;
+}
+
+export interface BreakdownReadResult {
+  ok: true;
+  text: string;
+  note: BreakdownNote;
+}
+
+/** 读取小红书笔记正文和互动数据；验证/登录失效时同时唤起全局验证窗口。 */
+export function readBreakdownLink(url: string): Promise<BreakdownReadResult> {
+  return request<BreakdownReadResult>('/api/breakdown/read', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url }),
+  }).catch((error: unknown) => {
+    if (error instanceof ApiError && error.status === 409) {
+      const message = error.message;
+      const code = message.includes('登录')
+        ? 'login_required'
+        : message.includes('网络') ? 'ip_blocked' : 'verification_required';
+      window.dispatchEvent(new CustomEvent('easel:xhs-verify', {
+        detail: { code, message },
+      }));
+    }
+    throw error;
   });
 }
 
@@ -483,6 +553,67 @@ export async function adoptOversize(files: File[], sessionId: string): Promise<A
 export function deleteSession(sessionKey: string): Promise<{ deleted: boolean }> {
   return request<{ deleted: boolean }>(`/api/session/${encodeURIComponent(sessionKey)}`, {
     method: 'DELETE',
+  });
+}
+
+export interface SessionStateSnapshot {
+  sessions: ChatSession[];
+  activeSessionId: string | null;
+  deletedSessionIds: string[];
+  initialized: boolean;
+}
+
+export interface SessionSyncResult {
+  ok: boolean;
+  saved: number;
+  skipped: number;
+  deleted: number;
+  total: number;
+}
+
+export function fetchSessionState(): Promise<SessionStateSnapshot> {
+  return request<SessionStateSnapshot>('/api/state/sessions');
+}
+
+export function syncSessionState(
+  sessions: ChatSession[],
+  deleted: string[],
+  activeSessionId?: string | null,
+  updateActive = false,
+  keepalive = false,
+): Promise<SessionSyncResult> {
+  return request<SessionSyncResult>('/api/state/sessions/sync', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sessions, deleted, activeSessionId, updateActive }),
+    keepalive,
+  });
+}
+
+export function saveActiveSession(activeSessionId: string | null, keepalive = false): Promise<{ ok: boolean }> {
+  return request<{ ok: boolean }>('/api/state/active', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ activeSessionId }),
+    keepalive,
+  });
+}
+
+export interface DraftStateSnapshot {
+  draft: PublishDraft | null;
+  updatedAt: number | null;
+}
+
+export function fetchDraftState(): Promise<DraftStateSnapshot> {
+  return request<DraftStateSnapshot>('/api/state/draft');
+}
+
+export function saveDraftState(draft: PublishDraft, keepalive = false): Promise<{ ok: boolean; updatedAt: number }> {
+  return request<{ ok: boolean; updatedAt: number }>('/api/state/draft', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ draft }),
+    keepalive,
   });
 }
 
@@ -999,6 +1130,86 @@ export function saveProxySettings(proxy: string): Promise<{ ok: boolean; proxy: 
   return request('/api/settings/proxy', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ proxy }),
+  });
+}
+
+// ═══ 设置面板 · 系统更新 ═══
+
+export type UpdateStepState = 'pending' | 'active' | 'done' | 'fail' | 'skipped';
+export type UpdateJobState = 'idle' | 'running' | 'restarting' | 'ok' | 'fail';
+
+export interface UpdateStep {
+  id: string;
+  label: string;
+  state: UpdateStepState;
+  detail: string;
+}
+
+export interface UpdateRestartState {
+  attempted: boolean;
+  ok: boolean;
+  log: string;
+  pid?: number;
+}
+
+export interface UpdateJob {
+  jobId: string | null;
+  state: UpdateJobState;
+  step: string;
+  detail: string;
+  steps: UpdateStep[];
+  logs: string[];
+  startedAt: number | null;
+  endedAt: number | null;
+  fromCommit: string;
+  toCommit: string;
+  error: string;
+  source: string;
+  branch: string;
+  restart: UpdateRestartState;
+  runnerPid?: number | null;
+  updatedAt: number;
+}
+
+export interface UpdateInfo {
+  source: string;
+  branch: string;
+  version: string;
+  currentCommit: string;
+  currentShort: string;
+  remoteCommit: string;
+  remoteShort: string;
+  updateAvailable: boolean;
+  localAhead: number;
+  remoteAhead: number;
+  fastForward: boolean;
+  clean: boolean;
+  branchMatches: boolean;
+  dirtyFiles: string[];
+  canApply: boolean;
+  blockedReason: string;
+  packageManager?: string;
+  packageManagerCommand?: string;
+  job: UpdateJob;
+}
+
+export function fetchUpdateInfo(): Promise<UpdateInfo> {
+  return request('/api/update');
+}
+
+export function checkUpdate(): Promise<UpdateInfo> {
+  return request('/api/update/check', { method: 'POST' });
+}
+
+export function fetchUpdateStatus(): Promise<UpdateJob> {
+  return request('/api/update/status');
+}
+
+export function applyUpdate(restart = true): Promise<UpdateJob> {
+  return request('/api/update/apply', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ restart }),
   });
 }
 

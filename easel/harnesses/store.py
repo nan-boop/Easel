@@ -56,8 +56,8 @@ def settings(outputs: Path, env: dict[str, str]) -> dict:
             for key, value in models.items()):
         raise HarnessError("Agent 模型设置格式无效")
     sandbox = data.get("sandbox", "workspace-write")
-    if sandbox not in ("read-only", "workspace-write"):
-        raise HarnessError("Agent 权限设置无效，只允许只读或工作区写入")
+    if sandbox not in ("read-only", "workspace-write", "danger-full-access"):
+        raise HarnessError("Agent 权限设置无效，请选择只读、工作区写入或完全访问")
     auto_approve = data.get("codex_auto_approve", False)
     if not isinstance(auto_approve, bool):
         raise HarnessError("Codex 自动授权设置必须为开关")

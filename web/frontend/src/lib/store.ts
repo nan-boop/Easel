@@ -1,4 +1,11 @@
 import type { UploadedFile, ChatQuestion } from './api';
+import {
+  fetchDraftState,
+  fetchSessionState,
+  saveActiveSession,
+  saveDraftState,
+  syncSessionState,
+} from './api';
 
 export interface ChatMessage {
   role: 'user' | 'assistant';
@@ -19,6 +26,7 @@ export interface ChatSession {
   sessionKey?: string;  // OpenClaw 的 session key，用于后端删除
   pendingTurnId?: string; // 进行中的可重连 job；浏览器重开后继续按 eventId 续流
   archived?: boolean;   // 归档：从 History 主列表移到「已归档」区
+  updated?: number;     // 本地/服务端最后修改时间，用于跨浏览器合并
 }
 
 /** 进行中的流式状态（存于 App，不随页面切换/ChatPage 卸载而丢失）。 */
@@ -37,9 +45,33 @@ export interface PublishDraft {
   platforms: string[];
   overrides: Record<string, string>;
   tags: string;   // 话题标签，逗号分隔（小红书绑话题；其它平台按需写入）
+  updatedAt?: number;
 }
 const PUBLISH_KEY = 'easel_publish_draft';
 const PREVIOUS_BRAND = ['post', 'craft'].join('');
+
+let localClock = 0;
+function nextTimestamp(): number {
+  localClock = Math.max(Date.now(), localClock + 1);
+  return localClock;
+}
+
+function notifySyncError(): void {
+  if (typeof window !== 'undefined') {
+    queueMicrotask(() => window.dispatchEvent(new Event('easel-session-sync-error')));
+  }
+}
+
+function notifySyncOk(): void {
+  if (typeof window !== 'undefined') {
+    queueMicrotask(() => window.dispatchEvent(new Event('easel-session-sync-ok')));
+  }
+}
+
+let draftSyncReady = false;
+let draftSyncTimer: ReturnType<typeof setTimeout> | null = null;
+let pendingDraft: PublishDraft | null = null;
+let draftSyncChain: Promise<void> = Promise.resolve();
 
 function readMigratedLocalValue(key: string, suffix: string): string | null {
   const current = localStorage.getItem(key);
@@ -66,13 +98,108 @@ export function loadPublishDraft(): PublishDraft {
   }
 }
 export function savePublishDraft(d: PublishDraft): void {
-  try { localStorage.setItem(PUBLISH_KEY, JSON.stringify(d)); } catch { /* quota */ }
+  const next = { ...d, updatedAt: nextTimestamp() };
+  try { localStorage.setItem(PUBLISH_KEY, JSON.stringify(next)); } catch { /* quota */ }
+  if (!draftSyncReady) return;
+  pendingDraft = next;
+  scheduleDraftFlush();
+}
+
+export async function hydratePublishDraft(local: PublishDraft): Promise<PublishDraft> {
+  try {
+    const remote = await fetchDraftState();
+    draftSyncReady = true;
+    const remoteUpdated = remote.updatedAt || 0;
+    const localUpdated = local.updatedAt || 0;
+    if (remote.draft && remoteUpdated >= localUpdated) {
+      const next = { ...PUBLISH_DEFAULT, ...remote.draft, updatedAt: remoteUpdated };
+      try { localStorage.setItem(PUBLISH_KEY, JSON.stringify(next)); } catch { /* quota */ }
+      return next;
+    }
+    if (!remote.draft && (local.title || local.body || local.tags)) {
+      pendingDraft = { ...local, updatedAt: nextTimestamp() };
+      scheduleDraftFlush();
+    }
+    return local;
+  } catch {
+    draftSyncReady = true;
+    notifySyncError();
+    return local;
+  }
+}
+
+function scheduleDraftFlush(): void {
+  if (draftSyncTimer) return;
+  draftSyncTimer = setTimeout(() => {
+    draftSyncTimer = null;
+    flushDraftSync();
+  }, 350);
+}
+
+function flushDraftSync(keepalive = false): void {
+  if (draftSyncTimer) {
+    clearTimeout(draftSyncTimer);
+    draftSyncTimer = null;
+  }
+  const draft = pendingDraft;
+  pendingDraft = null;
+  if (!draft) return;
+  draftSyncChain = draftSyncChain
+    .then(async () => {
+      await saveDraftState(draft, keepalive);
+      notifySyncOk();
+    })
+    .catch(() => {
+      if (!pendingDraft) pendingDraft = draft;
+      notifySyncError();
+    });
 }
 
 const STORAGE_KEY = 'easel_sessions';
 const ACTIVE_KEY = 'easel_active_session';
 const MAX_SESSIONS = 100;
 const TITLE_MAX_CHARS = 24;
+const SESSION_SYNC_DELAY = 120;
+const ACTIVE_SYNC_DELAY = 100;
+
+interface SessionObservation {
+  signature: string;
+  updated: number;
+}
+
+let observedSessions = new Map<string, SessionObservation>();
+let observedInitialized = false;
+let sessionSyncReady = false;
+let sessionSyncTimer: ReturnType<typeof setTimeout> | null = null;
+let sessionSyncChain: Promise<void> = Promise.resolve();
+const pendingSessionUpserts = new Map<string, ChatSession>();
+const pendingSessionDeletes = new Set<string>();
+let activeSyncTimer: ReturnType<typeof setTimeout> | null = null;
+let activeSyncValue: string | null | undefined;
+let activeSyncChain: Promise<void> = Promise.resolve();
+
+function sessionSignature(session: ChatSession): string {
+  return JSON.stringify({
+    title: session.title || '',
+    messages: session.messages || [],
+    persona: session.persona || '',
+    created: session.created || 0,
+    sessionKey: session.sessionKey || '',
+    pendingTurnId: session.pendingTurnId || '',
+    archived: Boolean(session.archived),
+  });
+}
+
+function setObservedSessions(sessions: ChatSession[]): void {
+  observedSessions = new Map(sessions.map((session) => [
+    session.id,
+    {
+      signature: sessionSignature(session),
+      updated: Number(session.updated) || Number(session.created) || nextTimestamp(),
+    },
+  ]));
+  observedInitialized = true;
+}
 
 /** 上次活跃会话 id：重开网页时据此续接上次对话（而不是丢进新空会话）。 */
 export function loadActiveId(): string | null {
@@ -83,6 +210,35 @@ export function saveActiveId(id: string | null): void {
     if (id) localStorage.setItem(ACTIVE_KEY, id);
     else localStorage.removeItem(ACTIVE_KEY);
   } catch { /* quota */ }
+  activeSyncValue = id;
+  scheduleActiveSync();
+}
+
+function scheduleActiveSync(): void {
+  if (!sessionSyncReady || activeSyncTimer) return;
+  activeSyncTimer = setTimeout(() => {
+    activeSyncTimer = null;
+    flushActiveSync();
+  }, ACTIVE_SYNC_DELAY);
+}
+
+function flushActiveSync(keepalive = false): void {
+  if (activeSyncTimer) {
+    clearTimeout(activeSyncTimer);
+    activeSyncTimer = null;
+  }
+  if (!sessionSyncReady || activeSyncValue === undefined) return;
+  const value = activeSyncValue;
+  activeSyncValue = undefined;
+  activeSyncChain = activeSyncChain
+    .then(async () => {
+      await saveActiveSession(value, keepalive);
+      notifySyncOk();
+    })
+    .catch(() => {
+      if (activeSyncValue === undefined) activeSyncValue = value;
+      notifySyncError();
+    });
 }
 
 function generateId(): string {
@@ -121,7 +277,7 @@ export function loadSessions(): ChatSession[] {
 function prune(sessions: ChatSession[]): ChatSession[] {
   let keptEmpty = false;
   const pruned = sessions.filter((s) => {
-    if (s.messages.length > 0) return true;
+    if (Array.isArray(s.messages) && s.messages.length > 0) return true;
     if (keptEmpty) return false;
     keptEmpty = true;
     return true;
@@ -129,15 +285,170 @@ function prune(sessions: ChatSession[]): ChatSession[] {
   return pruned.slice(0, MAX_SESSIONS);
 }
 
-export function saveSessions(sessions: ChatSession[]): boolean {
+function writeSessionCache(sessions: ChatSession[]): boolean {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(prune(sessions)));
     return true;
   } catch {
-    // Keep the live conversation in memory; never throw from a React state updater.
-    if (typeof window !== 'undefined') queueMicrotask(() => window.dispatchEvent(new Event('easel-session-save-error')));
+    if (typeof window !== 'undefined') {
+      queueMicrotask(() => window.dispatchEvent(new Event('easel-session-save-error')));
+    }
     return false;
   }
+}
+
+function queueSessionUpsert(session: ChatSession): void {
+  pendingSessionDeletes.delete(session.id);
+  pendingSessionUpserts.set(session.id, session);
+  scheduleSessionSync();
+}
+
+function queueSessionDelete(sessionId: string): void {
+  pendingSessionUpserts.delete(sessionId);
+  pendingSessionDeletes.add(sessionId);
+  scheduleSessionSync();
+}
+
+let sessionRetryDelay = 1000;
+function scheduleSessionSync(delay = SESSION_SYNC_DELAY): void {
+  if (!sessionSyncReady || sessionSyncTimer) return;
+  sessionSyncTimer = setTimeout(() => {
+    sessionSyncTimer = null;
+    flushSessionSync();
+  }, delay);
+}
+
+function flushSessionSync(keepalive = false): void {
+  if (sessionSyncTimer) {
+    clearTimeout(sessionSyncTimer);
+    sessionSyncTimer = null;
+  }
+  if (!sessionSyncReady || (!pendingSessionUpserts.size && !pendingSessionDeletes.size)) return;
+  const sessions = [...pendingSessionUpserts.values()];
+  const deleted = [...pendingSessionDeletes];
+  pendingSessionUpserts.clear();
+  pendingSessionDeletes.clear();
+  sessionSyncChain = sessionSyncChain
+    .then(async () => {
+      await syncSessionState(sessions, deleted, undefined, false, keepalive);
+      sessionRetryDelay = 1000;
+      notifySyncOk();
+    })
+    .catch(() => {
+      for (const session of sessions) {
+        if (!pendingSessionUpserts.has(session.id) && !pendingSessionDeletes.has(session.id)) {
+          pendingSessionUpserts.set(session.id, session);
+        }
+      }
+      for (const sessionId of deleted) {
+        if (!pendingSessionUpserts.has(sessionId)) pendingSessionDeletes.add(sessionId);
+      }
+      notifySyncError();
+      const retry = sessionRetryDelay;
+      sessionRetryDelay = Math.min(sessionRetryDelay * 2, 30_000);
+      scheduleSessionSync(retry);
+    });
+}
+
+export function saveSessions(sessions: ChatSession[]): boolean {
+  if (!observedInitialized) setObservedSessions(loadSessions());
+  const seen = new Set<string>();
+  const stamped = sessions.map((session) => {
+    seen.add(session.id);
+    const previous = observedSessions.get(session.id);
+    const signature = sessionSignature(session);
+    const updated = !previous || previous.signature !== signature
+      ? nextTimestamp()
+      : previous.updated;
+    return { ...session, updated };
+  });
+  const ok = writeSessionCache(stamped);
+
+  if (sessionSyncReady) {
+    for (const sessionId of observedSessions.keys()) {
+      if (!seen.has(sessionId)) queueSessionDelete(sessionId);
+    }
+    for (const session of stamped) {
+      const previous = observedSessions.get(session.id);
+      if (!previous || previous.signature !== sessionSignature(session)) {
+        queueSessionUpsert(session);
+      }
+    }
+  }
+  setObservedSessions(stamped);
+  return ok;
+}
+
+export interface HydratedSessions {
+  sessions: ChatSession[];
+  activeSessionId: string | null;
+  remote: boolean;
+}
+
+/** 合并本地缓存与服务端唯一真源；服务端为空时自动迁移旧 localStorage 数据。 */
+export async function hydrateSessions(localInput?: ChatSession[]): Promise<HydratedSessions> {
+  const local = localInput ?? loadSessions();
+  let remote;
+  try {
+    remote = await fetchSessionState();
+  } catch {
+    setObservedSessions(local);
+    sessionSyncReady = true;
+    writeSessionCache(local);
+    notifySyncError();
+    return { sessions: local, activeSessionId: loadActiveId(), remote: false };
+  }
+
+  const tombstoned = new Set(remote.deletedSessionIds || []);
+  const remoteById = new Map(remote.sessions.map((session) => [session.id, session]));
+  const merged = remote.sessions.filter((session) => !tombstoned.has(session.id));
+  const mergedIndex = new Map(merged.map((session, index) => [session.id, index]));
+  const uploads: ChatSession[] = [];
+  const localSeen = new Set<string>();
+
+  for (const session of local) {
+    if (!session?.id || tombstoned.has(session.id) || localSeen.has(session.id)) continue;
+    localSeen.add(session.id);
+    const remoteSession = remoteById.get(session.id);
+    if (remoteSession) {
+      const localUpdated = Number(session.updated) || Number(session.created) || 0;
+      const remoteUpdated = Number(remoteSession.updated) || Number(remoteSession.created) || 0;
+      if (localUpdated > remoteUpdated) {
+        const index = mergedIndex.get(session.id);
+        if (index !== undefined) merged[index] = session;
+        uploads.push(session);
+      }
+      continue;
+    }
+    merged.push(session);
+    mergedIndex.set(session.id, merged.length - 1);
+    uploads.push(session);
+  }
+
+  merged.sort((a, b) => (Number(b.updated) || Number(b.created) || 0)
+    - (Number(a.updated) || Number(a.created) || 0));
+  const validIds = new Set(merged.map((session) => session.id));
+  const localActive = loadActiveId();
+  const activeSessionId = remote.activeSessionId && validIds.has(remote.activeSessionId)
+    ? remote.activeSessionId
+    : localActive && validIds.has(localActive) ? localActive : null;
+
+  pendingSessionUpserts.clear();
+  pendingSessionDeletes.clear();
+  setObservedSessions(merged);
+  sessionSyncReady = true;
+  writeSessionCache(merged);
+  for (const session of uploads) queueSessionUpsert(session);
+  scheduleActiveSync();
+  return { sessions: merged, activeSessionId, remote: true };
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('pagehide', () => {
+    flushSessionSync(true);
+    flushActiveSync(true);
+    flushDraftSync(true);
+  });
 }
 
 export function createSession(persona?: string): ChatSession {
