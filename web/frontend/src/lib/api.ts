@@ -50,8 +50,16 @@ export interface HarnessSettingsResponse {
   models: Record<string, string>;
   sandbox: string;
   codex_auto_approve: boolean;
+  codex_api: CodexCustomAPIView;
   locked: boolean;
   agents: { id: string; label: string; protocol: string; installed: boolean; install_hint: string }[];
+}
+
+export interface CodexCustomAPIView {
+  enabled: boolean;
+  baseUrl: string;
+  protocol: string;
+  keyMasked: string;
 }
 
 export function fetchHarnessSettings(): Promise<HarnessSettingsResponse> {
@@ -68,11 +76,28 @@ export function fetchHarnessModels(runtime: string): Promise<{ runtime: string; 
   return request(`/api/settings/harness/models/${encodeURIComponent(runtime)}`, { method: 'POST' });
 }
 
-export function saveHarnessSettings(runtime: string, model: string, sandbox: string, codexAutoApprove?: boolean): Promise<HarnessSettingsResponse> {
+export function saveHarnessSettings(
+  runtime: string,
+  model: string,
+  sandbox: string,
+  codexAutoApprove?: boolean,
+  codexAPI?: { enabled: boolean; baseUrl: string; key: string; protocol: string },
+): Promise<HarnessSettingsResponse> {
   return request('/api/settings/harness', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ runtime, model, sandbox, codex_auto_approve: codexAutoApprove }),
+    body: JSON.stringify({
+      runtime,
+      model,
+      sandbox,
+      codex_auto_approve: codexAutoApprove,
+      codex_api: codexAPI ? {
+        enabled: codexAPI.enabled,
+        baseUrl: codexAPI.baseUrl,
+        key: codexAPI.key,
+        protocol: codexAPI.protocol,
+      } : undefined,
+    }),
   });
 }
 
@@ -1070,7 +1095,7 @@ export interface ModelSaveRow {
   key: string;
   key2?: string;
   primary?: boolean;
-  /** 自定义供应商上游协议：openai（默认）| anthropic */
+  /** 上游协议：openai（Chat Completions）| openai-responses | anthropic */
   protocol?: string;
   thinking?: boolean;
   thinkingFormat?: string;
@@ -1245,6 +1270,31 @@ export function runChannelSelftest(channel: string): Promise<{ channel: string; 
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ channel }),
+  });
+}
+
+export interface ModelConnectionResult {
+  ok: boolean;
+  ms: number;
+  detail?: string;
+  baseUrl: string;
+  model: string;
+  protocol: string;
+  testedAt: number;
+}
+
+export function testModelConnection(payload: {
+  baseUrl: string;
+  key: string;
+  model: string;
+  protocol: string;
+  slot: string;
+  name?: string;
+}): Promise<ModelConnectionResult> {
+  return request('/api/settings/models/test', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
   });
 }
 

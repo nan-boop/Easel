@@ -1,4 +1,4 @@
-"""Codex native app-server adapter; credentials remain in Codex."""
+"""Codex native app-server adapter with optional isolated Responses provider."""
 from __future__ import annotations
 
 import asyncio
@@ -8,7 +8,7 @@ from easel import __version__
 
 from . import store as harness_store
 from .base import Descriptor, HarnessError, RunRequest
-from .commands import base_command
+from .codex_config import app_server_command, custom_api
 from .permissions import can_auto_approve
 from .rpc import connection
 from .workspace import harness_instructions
@@ -147,7 +147,10 @@ class CodexAdapter:
                 return {"answers": {key: {"answers": value} for key, value in answers.items()}}
             raise HarnessError("不支持的 Codex 客户端请求")
 
-        command = list(request.command) if request.command else base_command("codex") + ["app-server"]
+        if request.command:
+            command = list(request.command)
+        else:
+            command = app_server_command(request, custom_api(request.env, request.model))
         async with connection(request, command, notify, respond) as rpc:
             if rpc.initialized is None:
                 rpc.initialized = await rpc.call("initialize", {

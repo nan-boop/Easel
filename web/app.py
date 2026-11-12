@@ -49,12 +49,15 @@ from easel.persona import (load_profile_text, persona_prefix, chat_turn_message,
 from easel.timeouts import TIMEOUT_CHAT, TIMEOUT_DIRECT, TIMEOUT_PRODUCE
 from easel.manual_publish import build_package, publishing_mode
 from easel.session_store import SessionStore, SessionStoreError
-from easel.direct_api import (DirectAPIError, SYSTEM_PROMPT, api_config, api_mode,
-                              history_path, read_settings, stream_chat)
+from easel.direct_api import (DIRECT_PROTOCOL_ENV, DirectAPIError, SYSTEM_PROMPT,
+                              api_config, api_mode, direct_protocol, history_path,
+                              read_settings, stream_chat)
 from easel import harnesses
 from easel import update as easel_update
 from easel.harnesses import store as harness_store
 from easel.harnesses.base import HarnessError, RunRequest
+from easel.harnesses.codex_config import (
+    CODEX_CUSTOM_BASE_ENV, CODEX_CUSTOM_KEY_ENV, CODEX_CUSTOM_PROTOCOL_ENV, custom_api)
 try:
     from easel.gateway_questions import (
         GatewayClient, GatewayQuestionError, GatewayQuestionClosedError, GatewayUnsupportedError,
@@ -545,6 +548,8 @@ SKILL_API_REQUIREMENTS: dict[str, dict] = {
 
 _ENV_ALLOWLIST: set[str] = {
     "EASEL_DIRECT_API_BASE_URL", "EASEL_DIRECT_API_KEY", "EASEL_DIRECT_API_MODEL",
+    DIRECT_PROTOCOL_ENV,
+    CODEX_CUSTOM_BASE_ENV, CODEX_CUSTOM_KEY_ENV, CODEX_CUSTOM_PROTOCOL_ENV,
     "EASEL_PROXY",   # 设置页「网络代理」持久化（_write_env 支持空串删行=清除）
     "EASEL_LAN_ACCESS",   # 设置页「局域网访问」持久化；空串=关闭
 }
@@ -1154,6 +1159,10 @@ def _chat_backend(session_id: str | None) -> str:
 def _model_target_allowed(base: str, slot: str = "") -> bool:
     # Trust only the exact gateway configured by the user, not arbitrary private URLs.
     settings = read_settings(ENV_FILE)
+    if slot == "codex":
+        configured_codex = settings.get(CODEX_CUSTOM_BASE_ENV, "").strip().rstrip("/")
+        if base.rstrip("/") == configured_codex and _valid_base_url(base):
+            return True
     configured = settings.get("EASEL_DIRECT_API_BASE_URL", "").strip().rstrip("/")
     if slot == "direct-api" and _direct_api_enabled() and base.rstrip("/") == configured:
         try:
@@ -1907,9 +1916,14 @@ def _model_channels(runtime: str | None = None) -> dict:
     om = (env.get("OPENAI_MODEL") or "").strip()
     ok_key = _is_set(env.get("OPENAI_API_KEY"))
     if direct:
+        try:
+            direct_api_protocol = direct_protocol(env)
+        except DirectAPIError:
+            direct_api_protocol = "openai"
         chat_rows.append({
             "slot": "direct-api", "order": 1, "name": "本地 / 内网 API 直连",
             "sub": "独立直连配置", "type": "openai",
+            "protocol": direct_api_protocol,
             "model": env.get("EASEL_DIRECT_API_MODEL", "").strip(),
             "baseUrl": env.get("EASEL_DIRECT_API_BASE_URL", "").strip(),
             "keyMasked": _mask_key(env.get("EASEL_DIRECT_API_KEY", "")),
@@ -1979,7 +1993,11 @@ def _model_channels(runtime: str | None = None) -> dict:
                 custom_rows.append({
                     "slot": "custom", "order": 0, "name": pkey, "sub": "自定义",
                     "type": "openai",
-                    "protocol": "anthropic" if pv.get("api") == "anthropic-messages" else "openai",
+                    "protocol": (
+                        "anthropic" if pv.get("api") == "anthropic-messages"
+                        else "openai-responses" if pv.get("api") == "openai-responses"
+                        else "openai"
+                    ),
                     "thinking": model_entry.get("reasoning") is True,
                     "thinkingFormat": compat.get("thinkingFormat", ""),
                     "model": mid or "", "baseUrl": pv.get("baseUrl") or "",
@@ -2052,18 +2070,36 @@ class ChatTransportRequest(BaseModel):
     transport: str
 
 
+class CodexCustomAPIRequest(BaseModel):
+    enabled: StrictBool
+    baseUrl: str = Field(default="", max_length=300)
+    key: str = Field(default="", max_length=400)
+    protocol: str = "openai-responses"
+
+
 class HarnessSettingsRequest(BaseModel):
     runtime: str
     model: str = Field(default="", max_length=240)
     sandbox: str = "workspace-write"
     codex_auto_approve: StrictBool | None = None
+    codex_api: CodexCustomAPIRequest | None = None
 
 
 @app.get("/api/settings/harness")
 async def api_harness_settings():
     config = _harness_settings()
+    env = read_settings(ENV_FILE)
+    codex_base = env.get(CODEX_CUSTOM_BASE_ENV, "").strip()
+    codex_key = env.get(CODEX_CUSTOM_KEY_ENV, "").strip()
     agents = await asyncio.to_thread(lambda: [harnesses.describe(runtime) for runtime in harness_store.IDS])
     return {**config, "agents": agents,
+            "codex_api": {
+                "enabled": bool(codex_base),
+                "baseUrl": codex_base,
+                "protocol": env.get(CODEX_CUSTOM_PROTOCOL_ENV, "openai-responses").strip()
+                or "openai-responses",
+                "keyMasked": _mask_key(codex_key),
+            },
             "locked": "EASEL_AGENT_RUNTIME" in read_settings(ENV_FILE)}
 
 
@@ -2081,6 +2117,43 @@ async def api_harness_settings_save(req: HarnessSettingsRequest):
         raise HTTPException(409, "请等待当前任务完成或停止后切换底座")
     if req.runtime not in ("api", "openclaw") and not harnesses.describe(req.runtime)["installed"]:
         raise HTTPException(409, "请先在终端安装并配置对应 Agent CLI，再切换")
+    codex_env_updates: dict[str, str] | None = None
+    if req.runtime == "codex" and req.codex_api is not None:
+        if any(name in os.environ for name in (
+                CODEX_CUSTOM_BASE_ENV, CODEX_CUSTOM_KEY_ENV, CODEX_CUSTOM_PROTOCOL_ENV)):
+            raise HTTPException(409, "启动环境已固定 Codex 自定义 API，请修改启动环境后重启")
+        current_env = read_settings(ENV_FILE)
+        if req.codex_api.enabled:
+            base = (req.codex_api.baseUrl or "").strip().rstrip("/")
+            key = (req.codex_api.key or "").strip()
+            protocol = _model_protocol(req.codex_api.protocol, allow_anthropic=False)
+            if protocol != "openai-responses":
+                raise HTTPException(
+                    400, "当前 Codex CLI 只支持 Responses API；Chat 请使用仅聊天模式或 OpenClaw")
+            saved_base = current_env.get(CODEX_CUSTOM_BASE_ENV, "").strip().rstrip("/")
+            saved_key = current_env.get(CODEX_CUSTOM_KEY_ENV, "").strip()
+            if not key and saved_key and base != saved_base:
+                raise HTTPException(400, "更换 Base URL 时必须重新填写 API Key")
+            try:
+                custom_api({
+                    CODEX_CUSTOM_BASE_ENV: base,
+                    CODEX_CUSTOM_KEY_ENV: key or saved_key,
+                    CODEX_CUSTOM_PROTOCOL_ENV: protocol,
+                }, req.model)
+            except HarnessError as error:
+                raise HTTPException(400, str(error)) from error
+            codex_env_updates = {
+                CODEX_CUSTOM_BASE_ENV: base,
+                CODEX_CUSTOM_PROTOCOL_ENV: protocol,
+            }
+            if key:
+                codex_env_updates[CODEX_CUSTOM_KEY_ENV] = key
+        else:
+            codex_env_updates = {
+                CODEX_CUSTOM_BASE_ENV: "",
+                CODEX_CUSTOM_KEY_ENV: "",
+                CODEX_CUSTOM_PROTOCOL_ENV: "",
+            }
     config = _harness_settings()
     if req.runtime == "openclaw" and api_mode(read_settings(ENV_FILE)):
         if "EASEL_CHAT_TRANSPORT" in os.environ:
@@ -2091,6 +2164,8 @@ async def api_harness_settings_save(req: HarnessSettingsRequest):
     if req.runtime == "codex" and req.codex_auto_approve is not None:
         config["codex_auto_approve"] = req.codex_auto_approve
     config["models"] = {**config["models"], req.runtime: req.model.strip()}
+    if codex_env_updates is not None:
+        _write_env(codex_env_updates)
     harness_store.write_json(OUTPUTS_DIR / "_harness" / "config.json", config)
     from easel.harnesses.rpc import close_sessions
     await close_sessions()
@@ -2190,8 +2265,12 @@ async def api_harness_models(runtime: str):
         raise HTTPException(400, "此底座不支持原生模型列表")
     from easel.harnesses.base import RunRequest
     from easel.harnesses.models import available_models
-    request = RunRequest("", PROJECT_ROOT, {
-        **_proxy_env(), "EASEL_ROOT": str(PROJECT_ROOT), "EASEL_AGENT_RUNTIME": runtime})
+    config = _harness_settings()
+    request = RunRequest(
+        "", PROJECT_ROOT,
+        {**read_settings(ENV_FILE), **_proxy_env(),
+         "EASEL_ROOT": str(PROJECT_ROOT), "EASEL_AGENT_RUNTIME": runtime},
+        model=config["models"].get(runtime, ""))
     try:
         models = await asyncio.wait_for(available_models(runtime, request), 25)
     except asyncio.TimeoutError as error:
@@ -2234,12 +2313,33 @@ def _write_env_direct(updates: dict[str, str]) -> None:
 
 
 RESERVED_PROVIDER_KEYS = {"openai", "anthropic", "relay"}
+MODEL_PROTOCOLS = {"openai", "openai-responses", "anthropic"}
+MODEL_PROTOCOL_ALIASES = {
+    "": "openai",
+    "chat": "openai",
+    "chat-completions": "openai",
+    "openai-chat": "openai",
+    "responses": "openai-responses",
+    "openai-response": "openai-responses",
+}
 THINKING_FORMATS = {
     "openai", "openrouter", "deepseek", "together", "qwen", "qwen-chat-template", "zai",
 }
 THINKING_COMPAT_KEYS = {
     "thinkingFormat", "supportsReasoningEffort", "supportedReasoningEfforts", "reasoningEffortMap",
 }
+
+
+def _model_protocol(value: str, *, allow_anthropic: bool = True) -> str:
+    raw = (value or "").strip().lower()
+    protocol = MODEL_PROTOCOL_ALIASES.get(raw, raw or "openai")
+    allowed = MODEL_PROTOCOLS if allow_anthropic else {"openai", "openai-responses"}
+    if protocol not in allowed:
+        choices = "openai / openai-responses"
+        if allow_anthropic:
+            choices += " / anthropic"
+        raise HTTPException(400, f"协议只支持 {choices}：{protocol}")
+    return protocol
 
 
 def _openclaw_provider_creds() -> dict[str, tuple[str, str]]:
@@ -2273,14 +2373,17 @@ def _sync_openclaw_chat(provider_updates: dict[str, dict], keep_custom: set[str]
         for pkey, vals in provider_updates.items():
             prov = providers.setdefault(pkey, {})
             base, key, model = vals.get('base', ''), vals.get('key', ''), vals.get('model', '')
-            # 协议只在用户显式选择时落盘：anthropic → api=anthropic-messages；
-            # openai/空 → 不写 api 字段（openclaw 默认 openai-completions，与既有配置零差异）。
+            # api 必须显式落盘，避免 OpenClaw 把普通 Chat Completions 供应商
+            # 自动推断成 Responses，或反过来。
             proto = (vals.get('protocol') or '').strip().lower()
-            if proto == 'anthropic' and prov.get('api') != 'anthropic-messages':
-                prov['api'] = 'anthropic-messages'
-                changed = True
-            elif proto == 'openai' and prov.get('api') == 'anthropic-messages':
-                prov.pop('api', None)
+            api_kind = {
+                'anthropic': 'anthropic-messages',
+                'openai-responses': 'openai-responses',
+                'openai': 'openai-completions',
+                '': 'openai-completions',
+            }.get(proto)
+            if api_kind and prov.get('api') != api_kind:
+                prov['api'] = api_kind
                 changed = True
             if base and prov.get('baseUrl') != base:
                 if _is_local_gateway_base(prov.get('baseUrl')):
@@ -2422,8 +2525,8 @@ class ModelSaveRow(BaseModel):
     key: str = ""
     key2: str = ""
     primary: bool = False
-    # 自定义供应商的上游协议：openai（默认，/chat/completions）或 anthropic
-    # （原生 /v1/messages；中转站卖原生 Claude 格式时选它）。
+    # 上游协议：openai（Chat Completions）、openai-responses（Responses API）
+    # 或 anthropic（原生 /v1/messages）。
     protocol: str = ""
     thinking: StrictBool | None = None
     thinkingFormat: str | None = None
@@ -2447,7 +2550,8 @@ async def api_settings_models_save(req: ModelSaveRequest):
         raise HTTPException(400, "请先切换到 API 直连模式再保存直连配置")
     if direct and ch0 == "chat" and any(
             name in os.environ for name in (
-                "EASEL_DIRECT_API_BASE_URL", "EASEL_DIRECT_API_MODEL", "EASEL_DIRECT_API_KEY")):
+                "EASEL_DIRECT_API_BASE_URL", "EASEL_DIRECT_API_MODEL",
+                "EASEL_DIRECT_API_KEY", DIRECT_PROTOCOL_ENV)):
         raise HTTPException(409, "运行环境已指定直连配置，请修改启动环境后重启")
     if ch0 in ("speech", "image", "video", "music"):
         import model_registry as _mr2
@@ -2545,6 +2649,9 @@ async def api_settings_models_save(req: ModelSaveRequest):
                 updates['EASEL_DIRECT_API_BASE_URL'] = base
             if key:
                 updates['EASEL_DIRECT_API_KEY'] = key
+            if row.protocol:
+                updates[DIRECT_PROTOCOL_ENV] = _model_protocol(
+                    row.protocol, allow_anthropic=False)
         elif slot == 'openai':
             if model:
                 updates['OPENAI_MODEL'] = model
@@ -2590,9 +2697,7 @@ async def api_settings_models_save(req: ModelSaveRequest):
                 raise HTTPException(400, f'「{name}」是内置槽位名，请换一个')
             if not model or not base:
                 raise HTTPException(400, f'自定义供应商「{name}」需要同时填模型和 Base URL')
-            proto = (getattr(row, 'protocol', '') or '').strip().lower()
-            if proto not in ('', 'openai', 'anthropic'):
-                raise HTTPException(400, f'协议只支持 openai / anthropic：{proto}')
+            proto = _model_protocol(getattr(row, 'protocol', ''))
             thinking_format = (row.thinkingFormat or '').strip().lower()
             if thinking_format and thinking_format not in THINKING_FORMATS:
                 raise HTTPException(400, f'不支持的思考格式：{thinking_format}')
@@ -2830,7 +2935,7 @@ class ModelsFetchRequest(BaseModel):
     """
     baseUrl: str = ""
     key: str = ""
-    protocol: str = "openai"  # openai | anthropic
+    protocol: str = "openai"  # openai | openai-responses | anthropic
     slot: str = ""
     name: str = ""  # 自定义供应商的 provider 名（slot='custom' 时用它查已存凭据）
 
@@ -2838,6 +2943,7 @@ class ModelsFetchRequest(BaseModel):
 # slot → (base 键, key 键)；与 _SLOT_ENV_KEYS 同源，外加自定义供应商。
 _FETCH_KEY_BY_SLOT = {
     'direct-api': ('EASEL_DIRECT_API_BASE_URL', 'EASEL_DIRECT_API_KEY'),
+    'codex': (CODEX_CUSTOM_BASE_ENV, CODEX_CUSTOM_KEY_ENV),
     'openai': ('OPENAI_BASE_URL', 'OPENAI_API_KEY'),
     'relay': ('EASEL_LLM_BASE_URL', 'EASEL_LLM_API_KEY'),
     'anthropic': ('ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY'),
@@ -2865,7 +2971,8 @@ async def api_models_available(req: ModelsFetchRequest):
             _bk, _kk = _FETCH_KEY_BY_SLOT.get(slot, ("", ""))
             _b, _k = _env.get(_bk, ""), _env.get(_kk, "")
         key = (_k or "").strip()
-        if slot == "direct-api" and key and base and base != (_b or "").strip().rstrip("/"):
+        if slot in {"direct-api", "codex"} and key and base \
+                and base != (_b or "").strip().rstrip("/"):
             raise HTTPException(400, "更换根地址时必须重新填写 Key，不能把已存 Key 发给其他地址")
         if not base and _b:
             base = _b.strip().rstrip("/")
@@ -2890,7 +2997,11 @@ async def api_models_available(req: ModelsFetchRequest):
             return None
 
     handlers = [_NoRedirect]
-    if slot == "direct-api" and _direct_api_enabled() and base == read_settings(ENV_FILE).get("EASEL_DIRECT_API_BASE_URL", "").strip().rstrip("/"):
+    saved_env = read_settings(ENV_FILE)
+    saved_proxy_base = saved_env.get(
+        "EASEL_DIRECT_API_BASE_URL" if slot == "direct-api" else CODEX_CUSTOM_BASE_ENV,
+        "").strip().rstrip("/")
+    if slot in {"direct-api", "codex"} and base == saved_proxy_base:
         handlers.append(urllib.request.ProxyHandler({}))
     _opener = urllib.request.build_opener(*handlers)
 
@@ -2917,6 +3028,180 @@ async def api_models_available(req: ModelsFetchRequest):
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"拉取失败：{type(e).__name__}: {e}"[:180]) from e
     return {"baseUrl": base, "models": models, "fetchedAt": int(time.time())}
+
+
+class ModelTestRequest(BaseModel):
+    baseUrl: str = ""
+    key: str = ""
+    model: str = ""
+    protocol: str = "openai"
+    slot: str = ""
+    name: str = ""
+
+
+def _saved_model_target(slot: str, name: str) -> tuple[str, str]:
+    env = read_settings(ENV_FILE) if _direct_api_enabled() else _read_env()
+    if slot == "custom":
+        return _openclaw_provider_creds().get((name or "").strip().lower(), ("", ""))
+    base_key, key_key = _FETCH_KEY_BY_SLOT.get(slot, ("", ""))
+    return (env.get(base_key, "") or ""), (env.get(key_key, "") or "")
+
+
+def _http_error_detail(error: urllib.error.HTTPError) -> str:
+    message = ""
+    try:
+        raw = error.read(8192).decode("utf-8", "replace")
+        payload = json.loads(raw)
+        if isinstance(payload, dict):
+            item = payload.get("error")
+            if isinstance(item, dict):
+                message = str(item.get("message") or item.get("code") or "")
+            elif isinstance(item, str):
+                message = item
+            message = message or str(payload.get("message") or "")
+    except (OSError, ValueError, UnicodeError):
+        pass
+    message = re.sub(r"[\x00-\x1f\x7f]+", " ", message).strip()
+    return f"HTTP {error.code}: {message[:180] or error.reason}"
+
+
+def _probe_model_completion(base: str, key: str, model: str, protocol: str,
+                            slot: str = "") -> dict:
+    """发送一次最小模型请求，验证地址、Key、协议和模型名能一起工作。"""
+    started = time.time()
+    if protocol == "anthropic":
+        url = base + "/v1/messages"
+        body = {
+            "model": model,
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "Reply with OK."}],
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": key,
+            "anthropic-version": "2023-06-01",
+        }
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+    elif protocol == "openai-responses":
+        url = base + "/responses"
+        body = {"model": model, "input": "Reply with OK.", "stream": False}
+        headers = {"Content-Type": "application/json"}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+    else:
+        url = base + "/chat/completions"
+        body = {
+            "model": model,
+            "messages": [{"role": "user", "content": "Reply with OK."}],
+            "stream": False,
+        }
+        headers = {"Content-Type": "application/json"}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *_a, **_kw):
+            return None
+
+    handlers = [_NoRedirect]
+    saved_env = read_settings(ENV_FILE)
+    saved_proxy_base = saved_env.get(
+        "EASEL_DIRECT_API_BASE_URL" if slot == "direct-api" else CODEX_CUSTOM_BASE_ENV,
+        "").strip().rstrip("/")
+    if slot in {"direct-api", "codex"} and base == saved_proxy_base:
+        handlers.append(urllib.request.ProxyHandler({}))
+    opener = urllib.request.build_opener(*handlers)
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with opener.open(request, timeout=45) as response:
+            raw = response.read(2 * 1024 * 1024).decode("utf-8", "replace")
+            elapsed = int((time.time() - started) * 1000)
+            try:
+                payload = json.loads(raw)
+            except ValueError:
+                return {"ok": False, "ms": elapsed, "detail": "端点返回了非 JSON 内容"}
+            if not isinstance(payload, dict):
+                return {"ok": False, "ms": elapsed, "detail": "端点返回格式不是对象"}
+            if payload.get("error"):
+                item = payload.get("error")
+                message = item.get("message") if isinstance(item, dict) else str(item)
+                return {"ok": False, "ms": elapsed, "detail": str(message or "模型返回错误")[:180]}
+            if protocol == "anthropic":
+                valid = isinstance(payload.get("content"), list) or bool(payload.get("id"))
+                detail = "" if valid else "响应中没有 content"
+            elif protocol == "openai-responses":
+                valid = bool(payload.get("id") or payload.get("output") or payload.get("output_text"))
+                if str(payload.get("status") or "").lower() in ("failed", "cancelled"):
+                    valid = False
+                detail = "" if valid else "响应中没有 output"
+            else:
+                valid = bool(payload.get("choices"))
+                detail = "" if valid else "响应中没有 choices"
+            return {"ok": bool(valid), "ms": elapsed, "detail": detail}
+    except urllib.error.HTTPError as error:
+        return {
+            "ok": False,
+            "ms": int((time.time() - started) * 1000),
+            "detail": _http_error_detail(error),
+        }
+    except urllib.error.URLError as error:
+        return {
+            "ok": False,
+            "ms": int((time.time() - started) * 1000),
+            "detail": f"连接失败：{str(error.reason)[:160]}",
+        }
+    except (TimeoutError, OSError) as error:
+        return {
+            "ok": False,
+            "ms": int((time.time() - started) * 1000),
+            "detail": f"请求失败：{type(error).__name__}: {str(error)[:140]}",
+        }
+
+
+@app.post("/api/settings/models/test")
+async def api_models_test(req: ModelTestRequest):
+    """对指定协议、Base URL、Key 和模型发一次最小请求，返回真实连通结果。"""
+    slot = (req.slot or "").strip()
+    name = (req.name or "").strip().lower()
+    base = (req.baseUrl or "").strip().rstrip("/")
+    key = (req.key or "").strip()
+    model = (req.model or "").strip()
+    protocol = _model_protocol(req.protocol or "openai",
+                               allow_anthropic=slot not in {"direct-api", "codex"})
+    if slot == "codex" and protocol != "openai-responses":
+        raise HTTPException(
+            400, "当前 Codex CLI 只支持 Responses API；Chat 请使用仅聊天模式或 OpenClaw")
+    saved_base, saved_key = _saved_model_target(slot, name) if slot else ("", "")
+    saved_base = (saved_base or "").strip().rstrip("/")
+    if not base:
+        base = saved_base
+    if not key and saved_key:
+        if base and saved_base and base != saved_base:
+            raise HTTPException(400, "更换 Base URL 时必须重新填写 Key，不能把已存 Key 发给其他地址")
+        key = saved_key.strip()
+    if slot == "direct-api" and not model:
+        model = read_settings(ENV_FILE).get("EASEL_DIRECT_API_MODEL", "").strip()
+    if not base:
+        raise HTTPException(400, "Base URL 不能为空")
+    if not _valid_base_url(base):
+        raise HTTPException(400, "Base URL 不合法")
+    if not model or len(model) > 120 or any(c in model for c in "\r\n"):
+        raise HTTPException(400, "请选择或填写正确的模型名")
+    if key and (any(c.isspace() for c in key) or len(key) > 400):
+        raise HTTPException(400, "API Key 格式不正确")
+    if not _model_target_allowed(base, slot):
+        raise HTTPException(400, "目标指向本机/内网地址，已拒绝（避免把 API Key 发给内网服务）")
+
+    result = await asyncio.to_thread(_probe_model_completion, base, key, model, protocol, slot)
+    result.update({"baseUrl": base, "model": model, "protocol": protocol,
+                   "testedAt": int(time.time())})
+    return result
 
 
 @app.post("/api/settings/models/selftest")

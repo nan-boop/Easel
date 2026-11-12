@@ -8,7 +8,7 @@ import type { JobView } from './EnvBoard';
 import {
   fetchEnvTools, startEnvInstall, fetchEnvJob,
   fetchModelChannels, runChannelSelftest, saveModelConfig,
-  fetchLocalAgents, enableLocalAgent, fetchAvailableModels,
+  fetchLocalAgents, enableLocalAgent, fetchAvailableModels, testModelConnection,
   fetchProxySettings, saveProxySettings,
   fetchLanAccessSettings, saveLanAccessSettings,
 } from '../lib/api';
@@ -225,6 +225,9 @@ export default function SettingsPanel({ onClose, banner = '' }: Props) {
   const [selftest, setSelftest] = useState<{ testedAt: number; byBase: Record<string, SelftestResult> } | null>(null);
   const [testing, setTesting] = useState(false);
   const [selftestNote, setSelftestNote] = useState('');
+  const [rowTests, setRowTests] = useState<Record<string, {
+    loading?: boolean; ok?: boolean; text: string; detail?: string;
+  }>>({});
   // 本机 agent CLI（Claude Code / Gemini CLI…）：装了并登录过就免 API key
   const [localAgents, setLocalAgents] = useState<LocalAgentInfo[]>([]);
   const [localAgentsErr, setLocalAgentsErr] = useState('');
@@ -274,10 +277,16 @@ export default function SettingsPanel({ onClose, banner = '' }: Props) {
     }
   }, []);
 
+  const protocolOfRow = (r: ModelRow) => (
+    r.slot === 'custom' || r.slot === 'direct-api'
+      ? (r.protocol || 'openai')
+      : (r.type === 'anthropic' ? 'anthropic' : 'openai')
+  );
+
   const pullModels = useCallback(async (key: string, r: ModelRow) => {
     setModelLists((m) => ({ ...m, [key]: { loading: true, models: m[key]?.models || [], err: '' } }));
     try {
-      const proto = r.slot === 'custom' ? (r.protocol || 'openai') : (r.type === 'anthropic' ? 'anthropic' : 'openai');
+      const proto = protocolOfRow(r);
       const d = await fetchAvailableModels(r.baseUrl || '', r.keyNew || '', proto, r.slot || '', r.name || '');
       const fetchedAt = Date.now();
       setModelLists((m) => ({ ...m, [key]: { loading: false, models: d.models, err: d.models.length ? '' : '该端点没有返回模型', fetchedAt } }));
@@ -290,6 +299,40 @@ export default function SettingsPanel({ onClose, banner = '' }: Props) {
       }
     } catch (e) {
       setModelLists((m) => ({ ...m, [key]: { loading: false, models: m[key]?.models || [], err: e instanceof Error ? e.message : '拉取失败' } }));
+    }
+  }, []);
+
+  const doRowTest = useCallback(async (key: string, r: ModelRow) => {
+    if (!r.model.trim()) {
+      setRowTests((state) => ({ ...state, [key]: { ok: false, text: '缺模型名', detail: '请先填写模型名' } }));
+      return;
+    }
+    if (!r.baseUrl.trim() && r.slot !== 'direct-api') {
+      setRowTests((state) => ({ ...state, [key]: { ok: false, text: '缺 Base URL', detail: '请先填写 Base URL' } }));
+      return;
+    }
+    setRowTests((state) => ({ ...state, [key]: { loading: true, text: '测试中…' } }));
+    try {
+      const result = await testModelConnection({
+        baseUrl: r.baseUrl || '',
+        key: r.keyNew || '',
+        model: r.model,
+        protocol: protocolOfRow(r),
+        slot: r.slot || '',
+        name: r.name || '',
+      });
+      setRowTests((state) => ({
+        ...state,
+        [key]: result.ok
+          ? { ok: true, text: `✓ ${result.ms}ms`, detail: `${result.protocol} · ${result.model} · ${result.ms}ms` }
+          : { ok: false, text: `✗ ${(result.detail || '失败').slice(0, 30)}`, detail: result.detail || '模型连通测试失败' },
+      }));
+    } catch (e) {
+      const detail = e instanceof Error ? e.message : '测试请求失败';
+      setRowTests((state) => ({
+        ...state,
+        [key]: { ok: false, text: `✗ ${detail.slice(0, 30)}`, detail },
+      }));
     }
   }, []);
 
@@ -351,8 +394,9 @@ export default function SettingsPanel({ onClose, banner = '' }: Props) {
         key: r.keyNew || '',
         key2: r.keyNew2 || '',
         primary: r.role === '主',
-        // 协议只对自定义供应商有意义；其余行后端不读这个字段
-        protocol: r.slot === 'custom' ? (r.protocol || 'openai') : undefined,
+        // 协议只对自定义供应商和 API 直连有意义；其余行后端不读这个字段
+        protocol: r.slot === 'custom' || r.slot === 'direct-api'
+          ? (r.protocol || 'openai') : undefined,
         thinking: r.slot === 'custom' ? r.thinking : undefined,
         thinkingFormat: r.slot === 'custom' && r.thinking && r.protocol !== 'anthropic'
           ? (r.thinkingFormat || undefined) : undefined,
@@ -373,6 +417,7 @@ export default function SettingsPanel({ onClose, banner = '' }: Props) {
         music: d.channels.music?.rows || [],
         speech: d.channels.speech?.rows || [],
       });
+      setRowTests({});
       setSavedNote(d.note ? `✓ 已保存（${d.note}）` : '✓ 已保存');
       void refreshEnv();
     } catch (e) {
@@ -402,7 +447,15 @@ export default function SettingsPanel({ onClose, banner = '' }: Props) {
     result: localReady ? '✓ 已就绪' : (tools.length ? '未装（去环境安装）' : '检测中…'),
   };
 
-  const resultText = (row: ModelRow): { text: string; cls: string } => {
+  const resultText = (row: ModelRow, testKey = ''): { text: string; cls: string; detail?: string } => {
+    const tested = testKey ? rowTests[testKey] : undefined;
+    if (tested) {
+      return {
+        text: tested.text,
+        detail: tested.detail,
+        cls: tested.loading ? '' : tested.ok ? 'good' : 'bad',
+      };
+    }
     const st = row.baseUrl && row.baseUrl !== '—' ? selftest?.byBase[row.baseUrl] : undefined;
     if (st) return st.ok ? { text: `✓ ${st.ms}ms`, cls: 'good' } : { text: `✗ ${(st.detail || '失败').slice(0, 42)}`, cls: 'bad' };
     if (row.result.includes('已就绪') || row.result.includes('已配置')) return { text: row.result, cls: 'good' };
@@ -453,6 +506,7 @@ export default function SettingsPanel({ onClose, banner = '' }: Props) {
       setProtoDd(shift);
     };
     shiftBoardKeys('chat');
+    setRowTests({});
     setChatRows((rs) => {
       const gone = rs[i];
       const left = rs.filter((_, j) => j !== i);
@@ -494,7 +548,13 @@ export default function SettingsPanel({ onClose, banner = '' }: Props) {
 
   const renderBoard = (
     rows: ModelRow[],
-    ops?: { onRow?: (i: number, patch: Partial<ModelRow>) => void; onPrimary?: (i: number) => void; onRemove?: (i: number) => void; media?: boolean },
+    ops?: {
+      onRow?: (i: number, patch: Partial<ModelRow>) => void;
+      onPrimary?: (i: number) => void;
+      onRemove?: (i: number) => void;
+      onTest?: (i: number, row: ModelRow) => void;
+      media?: boolean;
+    },
     board = 'chat',
   ) => {
     // 每行的会话态键：通道#行号 —— 不同通道/删除行后错位不再互相污染（见 modelLists 注释）
@@ -512,12 +572,23 @@ export default function SettingsPanel({ onClose, banner = '' }: Props) {
           <span />
         </div>
         {rows.map((r, i) => {
-          const rt = resultText(r);
+          const rt = resultText(r, ops?.onTest ? k(i) : '');
           const ed = SLOT_EDIT[r.slot || '']
             || (ops?.media && r.slot
               ? { model: r.modelEditable !== false, base: r.baseEditable !== false }
               : undefined);
           const isCustom = r.slot === 'custom';
+          const protocolEditable = isCustom || r.slot === 'direct-api';
+          const protocolShort = r.protocol === 'openai-responses'
+            ? 'responses'
+            : r.protocol === 'anthropic' ? 'anthropic' : 'chat';
+          const protocolOptions = [
+            { value: 'openai', label: 'OpenAI Chat（/chat/completions）' },
+            { value: 'openai-responses', label: 'OpenAI Responses（/responses）' },
+            ...(isCustom
+              ? [{ value: 'anthropic', label: 'Anthropic Messages（/v1/messages）' }]
+              : []),
+          ];
           return (
             <div className="prow" key={i}>
               <span className={`step${r.order === 0 ? ' ghost' : ''}`}>{isCustom ? i + 1 : r.order}</span>
@@ -533,7 +604,7 @@ export default function SettingsPanel({ onClose, banner = '' }: Props) {
               ) : (
                 <span className="pname">{r.name}<small>{r.sub}</small></span>
               )}
-              {isCustom && ed && ed.base ? (
+              {protocolEditable && ed && ed.base ? (
                 <span
                   className="proto-trigger"
                   role="button"
@@ -541,7 +612,7 @@ export default function SettingsPanel({ onClose, banner = '' }: Props) {
                   aria-haspopup="listbox"
                   aria-expanded={!!protoDd[k(i)]}
                   ref={(el) => { protoRefs.current[k(i)] = el; }}
-                  title="上游协议：中转站是 OpenAI 兼容格式选 openai；原生 Anthropic 格式（/v1/messages）选 anthropic"
+                  title="上游协议：Chat 请求 /chat/completions；Responses 请求 /responses；Anthropic 请求 /v1/messages"
                   onClick={() => setProtoDd((s) => ({ ...s, [k(i)]: !s[k(i)] }))}
                   onKeyDown={(event) => {
                     if (event.key === 'Enter' || event.key === ' ') {
@@ -550,11 +621,11 @@ export default function SettingsPanel({ onClose, banner = '' }: Props) {
                     }
                   }}
                 >
-                  <span className="proto-label">{r.protocol === 'anthropic' ? 'anthropic' : 'openai'}</span>
+                  <span className="proto-label">{protocolShort}</span>
                   {protoDd[k(i)] && (
                     <OptionsDropdown
                       anchor={protoRefs.current[k(i)]}
-                      items={[{ value: 'openai', label: 'openai（OpenAI 兼容）' }, { value: 'anthropic', label: 'anthropic（原生 /v1/messages）' }]}
+                      items={protocolOptions}
                       current={r.protocol || 'openai'}
                       onPick={(v) => {
                         ops?.onRow?.(i, { protocol: v });
@@ -571,8 +642,8 @@ export default function SettingsPanel({ onClose, banner = '' }: Props) {
                     />
                   )}
                 </span>
-              ) : isCustom ? (
-                <span title="保存后可切换协议">{r.protocol === 'anthropic' ? 'anthropic' : 'openai'}</span>
+              ) : protocolEditable ? (
+                <span title="保存后可切换协议">{protocolShort}</span>
               ) : (
                 <span>{r.type}</span>
               )}
@@ -702,7 +773,20 @@ export default function SettingsPanel({ onClose, banner = '' }: Props) {
               ) : (
                 <span className={`tag ${r.role === '主' ? 'main' : 'backup'}`}>{r.role}</span>
               )}
-              <span className={`stt ${rt.cls}`}>{rt.text}</span>
+              {ops?.onTest && r.slot ? (
+                <button
+                  type="button"
+                  className={`stt stt-test ${rt.cls}`}
+                  onClick={() => ops.onTest?.(i, r)}
+                  disabled={rowTests[k(i)]?.loading}
+                  title={rt.detail || '点击测试该模型连通；会发送一次最小请求'}
+                >
+                  {rowTests[k(i)]?.loading && <span className="spin" />}
+                  {rt.text}
+                </button>
+              ) : (
+                <span className={`stt ${rt.cls}`} title={rt.detail}>{rt.text}</span>
+              )}
               {isCustom && ops?.onRemove ? (
                 <button className="row-del" onClick={() => ops.onRemove?.(i)} title="删除该供应商">✕</button>
               ) : ops?.media && r.slot ? (
@@ -749,7 +833,7 @@ export default function SettingsPanel({ onClose, banner = '' }: Props) {
               disabled={testing || modelLoading || selectedHarness !== harness || (!['api', 'openclaw'].includes(harness) && (sec !== 'model' || chan === 'chat'))}
               title={!['api', 'openclaw'].includes(harness) ? '原生对话请发送消息或运行 easel ping 验证' : undefined}
             >
-              {testing ? '自测中…' : '全部自测'}
+              {testing ? '检查中…' : '检查端点'}
             </button>
             <button className="settings-close" onClick={onClose} title="关闭（Esc）">✕</button>
           </div>
@@ -804,11 +888,29 @@ export default function SettingsPanel({ onClose, banner = '' }: Props) {
                       <span className={`pill ${chatOk ? 'ok' : 'off'}`}><span className="dot" />{chatOk ? '已配置' : '未配置'}</span>
                       {selftest && <span className="desc">上次自测 {hhmm(selftest.testedAt)}</span>}
                       <span className="spacer" />
-                      <button className="btn btn-sm" onClick={() => void doSelftest('chat')} disabled={testing || selectedHarness !== harness}>自测本通道</button>
+                      <button
+                        className="btn btn-sm"
+                        onClick={() => void doSelftest('chat')}
+                        disabled={testing || selectedHarness !== harness}
+                        title="只检查 Base URL 的模型列表端点；点击每行「上次结果」可测试具体模型是否真的能回复"
+                      >检查端点</button>
                     </div>
-                    {renderBoard(chatRows, { onRow: (i, p) => updateRow(setChatRows, i, p), onPrimary: setPrimaryRow, onRemove: removeRow }, 'chat')}
-                    {selectedHarness === 'api' ? <div className="foot-note">此通道使用独立的 EASEL_DIRECT_API_* 配置，与原有 OpenAI 通道分开保存。支持聊天、画像、文本和图片附件（需模型支持图片）。没有本机文件、浏览器或技能执行工具。</div>
-                      : <div className="add-row" onClick={addProvider}>＋ 添加供应商（填名称 / 模型 / Base URL / Key；点「设为主」切换生效通道）</div>}
+                    {renderBoard(chatRows, {
+                      onRow: (i, patch) => {
+                        setRowTests((state) => {
+                          const next = { ...state };
+                          delete next[`chat#${i}`];
+                          return next;
+                        });
+                        updateRow(setChatRows, i, patch);
+                      },
+                      onPrimary: setPrimaryRow,
+                      onRemove: removeRow,
+                      onTest: (i, row) => void doRowTest(`chat#${i}`, row),
+                    }, 'chat')}
+                    {selectedHarness === 'api'
+                      ? <div className="foot-note">API 直连支持 OpenAI Chat（`/chat/completions`）和 OpenAI Responses（`/responses`）。Base URL 通常填到 `/v1`，例如 `https://api.openai.com/v1`；填写模型名后，点击右侧「上次结果」列可发送一次最小请求测试连通。此模式不含本机文件、浏览器或技能执行工具。</div>
+                      : <div className="add-row" onClick={addProvider}>＋ 添加供应商（填名称 / 模型 / Base URL / Key；OpenAI Chat、OpenAI Responses、Anthropic 三种协议；点「设为主」切换生效通道）</div>}
                     {harness === 'openclaw' && (() => {
                       // 本机 agent 区块：装了 Claude Code / Gemini CLI 并登录过的用户不需要填 API Key。
                       // 只展示「已装」的行 —— 没装的用户看一眼全是灰的只会困惑。
@@ -856,7 +958,7 @@ export default function SettingsPanel({ onClose, banner = '' }: Props) {
                         </div>
                       );
                     })()}
-                    <div className="foot-note">改完点右上角「保存配置」（key 留空=不改）；自动降级链随统一网关接入开放。</div>
+                    <div className="foot-note">改完点右上角「保存配置」（key 留空=不改）。点击每行「上次结果」列会向所选模型发送一次最小请求，验证协议、地址、Key 和模型名；自动降级链随统一网关接入开放。</div>
                   </section>
                 )}
 
@@ -1045,7 +1147,9 @@ export default function SettingsPanel({ onClose, banner = '' }: Props) {
         <div className="settings-foot">
           {harness === 'api' || harness === 'openclaw'
             ? 'ⓘ 供应商配置保存到 .env；API 直连仅聊天、无工具。切换底座或对话模式后请新建对话。'
-            : 'ⓘ 原生 Agent 认证由其 CLI 管理；「保存底座」只保存底座、模型覆盖和权限设置。媒体通道仍单独配置。'}
+            : harness === 'codex'
+              ? 'ⓘ Codex 可使用原生登录或自定义 Responses API；自定义地址、Key 和模型在「Agent 底座」中保存。'
+              : 'ⓘ 原生 Agent 认证由其 CLI 管理；「保存底座」只保存底座、模型覆盖和权限设置。媒体通道仍单独配置。'}
         </div>
       </div>
     </div>

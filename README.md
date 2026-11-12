@@ -285,6 +285,49 @@ OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_MODEL=gpt-4o
 ```
 
+### 自定义 OpenAI Chat / Responses
+
+在 Web「设置 → 模型配置」中可以直接配置自定义地址、Key 和模型：
+
+- **API 直连**：选择“OpenAI Chat”调用 `{Base URL}/chat/completions`，选择
+  “OpenAI Responses”调用 `{Base URL}/responses`。Base URL 通常需要包含 `/v1`，
+  例如 `https://api.openai.com/v1`。
+- **OpenClaw 自定义供应商**：点击“添加供应商”，填写名称、模型、Base URL 和 Key，
+  再在“类型”列选择 Chat、Responses 或 Anthropic；保存后写入对应的 OpenClaw `api`
+  协议。
+- **Codex 自定义 API**：在“Agent 底座 → Codex”打开“自定义 API”，填写模型覆盖、
+  Base URL 和 Key。Easel 会用独立的 `easel-custom` provider 和 `-c` 启动参数连接，
+  不改写本机 `~/.codex/config.toml`。当前 Codex CLI 只接受 Responses 协议
+  （`{Base URL}/responses`）；需要 Chat Completions 时请使用 API 直连或 OpenClaw。
+
+每行右侧“上次结果”列可点击。它会向当前模型发送一次最小请求，同时验证协议、地址、
+Key 和模型名；它与“检查端点”不同，后者只检查模型列表地址是否可达。
+Codex 自定义 API 下方也有“测试连通”，逻辑相同。
+
+直连模式也可以写入 `.env`：
+
+```dotenv
+EASEL_CHAT_TRANSPORT=api
+EASEL_DIRECT_API_BASE_URL=https://api.openai.com/v1
+EASEL_DIRECT_API_KEY=你的_API_Key
+EASEL_DIRECT_API_MODEL=你的模型名
+EASEL_DIRECT_API_PROTOCOL=openai-responses
+```
+
+`EASEL_DIRECT_API_PROTOCOL` 支持 `openai`（Chat Completions）和
+`openai-responses`（Responses API）。协议必须与上游实际提供的接口一致，不能把
+Chat 地址填成 Responses，或反过来。
+
+Codex 自定义 API 也可以在 `.env` 中预置：
+
+```dotenv
+EASEL_CODEX_API_BASE_URL=https://api.example.com/v1
+EASEL_CODEX_API_KEY=你的_API_Key
+EASEL_CODEX_API_PROTOCOL=openai-responses
+```
+
+模型名仍保存在 Agent 底座设置中。使用自定义 API 时必须填写模型名。
+
 如果聊天 API 不提供向量模型，请单独配置 Embedding API；否则 OpenClaw 会默认请求 `text-embedding-3-small`，可能得到“模型不可用”。不配置独立向量 API 时，Easel 会显式使用关键词记忆检索，不会反复请求聊天端点的 embedding 模型：
 
 ```dotenv

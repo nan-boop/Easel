@@ -1516,6 +1516,14 @@ textarea.field { resize: vertical; min-height: 90px; }
 .settings-overlay .stt.good { color: var(--green); }
 .settings-overlay .stt.bad { color: var(--red); }
 .settings-overlay .stt.warn-text { color: var(--amber); }
+.settings-overlay .stt-test {
+  appearance: none; border: 0; background: transparent; padding: 0;
+  display: inline-flex; align-items: center; gap: 4px; min-width: 0;
+  text-align: left; cursor: pointer;
+}
+.settings-overlay .stt-test:hover:not(:disabled) { color: var(--accent-end); text-decoration: underline; }
+.settings-overlay .stt-test:disabled { cursor: wait; opacity: .75; }
+.settings-overlay .stt-test .spin { width: 10px; height: 10px; border-width: 1.5px; flex: 0 0 auto; }
 .settings-overlay .empty { padding: 16px; color: var(--text-secondary); display: flex; align-items: center; gap: 10px; font-size: 13.5px; }
 .settings-overlay .hint { color: var(--text-tertiary); font-size: 12.5px; }
 .settings-overlay .foot-note { margin-top: 12px; color: var(--text-tertiary); font-size: 12.5px; }

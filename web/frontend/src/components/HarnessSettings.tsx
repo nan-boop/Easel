@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
-import { fetchHarnessModels, fetchHarnessSettings, saveHarnessSettings } from '../lib/api';
+import {
+  fetchHarnessModels, fetchHarnessSettings, saveHarnessSettings, testModelConnection,
+} from '../lib/api';
 import type { HarnessModel, HarnessSettingsResponse } from '../lib/api';
 import SettingsSelect from './SettingsSelect';
 
@@ -19,6 +21,12 @@ export default function HarnessSettings({ onChange, onSelect }: {
   const [modelNote, setModelNote] = useState('');
   const [refresh, setRefresh] = useState(0);
   const [settingsLoading, setSettingsLoading] = useState(true);
+  const [codexEnabled, setCodexEnabled] = useState(false);
+  const [codexBase, setCodexBase] = useState('');
+  const [codexKey, setCodexKey] = useState('');
+  const [codexKeyMasked, setCodexKeyMasked] = useState('');
+  const [codexTesting, setCodexTesting] = useState(false);
+  const [codexTest, setCodexTest] = useState<{ ok: boolean; text: string; detail?: string } | null>(null);
   const modelRequest = useRef(0);
 
   useEffect(() => {
@@ -32,6 +40,11 @@ export default function HarnessSettings({ onChange, onSelect }: {
       setModel(value.models[value.runtime] || '');
       setSandbox(value.sandbox);
       setAutoApprove(value.codex_auto_approve ?? false);
+      setCodexEnabled(Boolean(value.codex_api?.enabled));
+      setCodexBase(value.codex_api?.baseUrl || '');
+      setCodexKey('');
+      setCodexKeyMasked(value.codex_api?.keyMasked || '');
+      setCodexTest(null);
       onChange(value.runtime);
       onSelect(value.runtime);
     }).catch((error) => {
@@ -45,6 +58,7 @@ export default function HarnessSettings({ onChange, onSelect }: {
   const selected = settings?.agents.find((agent) => agent.id === runtime);
   const fullAccess = sandbox === 'danger-full-access';
   const nativeModels = catalogs[runtime] || [];
+  const customCodex = runtime === 'codex' && codexEnabled;
   const pullModels = async () => {
     const requested = runtime;
     const sequence = ++modelRequest.current;
@@ -63,16 +77,60 @@ export default function HarnessSettings({ onChange, onSelect }: {
       if (modelRequest.current === sequence) setModelLoading(false);
     }
   };
+  const testCodexAPI = async () => {
+    if (!model.trim()) {
+      setCodexTest({ ok: false, text: '缺模型名', detail: '请先填写模型名称' });
+      return;
+    }
+    if (!codexBase.trim()) {
+      setCodexTest({ ok: false, text: '缺 Base URL', detail: '请先填写自定义 API 地址' });
+      return;
+    }
+    setCodexTesting(true);
+    setCodexTest(null);
+    try {
+      const result = await testModelConnection({
+        baseUrl: codexBase,
+        key: codexKey,
+        model,
+        protocol: 'openai-responses',
+        slot: 'codex',
+      });
+      setCodexTest(result.ok
+        ? { ok: true, text: `✓ ${result.ms}ms`, detail: `${result.protocol} · ${result.model} · ${result.ms}ms` }
+        : { ok: false, text: `✗ ${(result.detail || '失败').slice(0, 32)}`, detail: result.detail });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : '测试请求失败';
+      setCodexTest({ ok: false, text: `✗ ${detail.slice(0, 32)}`, detail });
+    } finally {
+      setCodexTesting(false);
+    }
+  };
   const save = async () => {
     setBusy(true);
     setNote('');
     try {
-      const value = await saveHarnessSettings(runtime, model, sandbox, runtime === 'codex' ? autoApprove : undefined);
+      const value = await saveHarnessSettings(
+        runtime,
+        model,
+        sandbox,
+        runtime === 'codex' ? autoApprove : undefined,
+        runtime === 'codex'
+          ? { enabled: codexEnabled, baseUrl: codexBase, key: codexKey, protocol: 'openai-responses' }
+          : undefined,
+      );
       setSettings(value);
+      setCodexEnabled(Boolean(value.codex_api?.enabled));
+      setCodexBase(value.codex_api?.baseUrl || '');
+      setCodexKey('');
+      setCodexKeyMasked(value.codex_api?.keyMasked || '');
+      setCodexTest(null);
       onChange(value.runtime);
-      setNote(runtime === 'codex' && sandbox === 'danger-full-access'
-        ? '已保存并立即生效。当前对话及后续对话的本机执行授权都会自动放行，不再逐次询问。'
-        : '已保存，请新建对话；旧对话仍保留在原底座，不迁移历史。');
+      setNote(runtime === 'codex' && codexEnabled
+        ? '已保存 Codex 自定义 API；请新建对话验证。接口必须是 OpenAI Responses 协议。'
+        : runtime === 'codex' && sandbox === 'danger-full-access'
+          ? '已保存并立即生效。当前对话及后续对话的本机执行授权都会自动放行，不再逐次询问。'
+          : '已保存，请新建对话；旧对话仍保留在原底座，不迁移历史。');
     } catch (error) {
       setNote(`保存失败：${error instanceof Error ? error.message : String(error)}`);
     } finally {
@@ -136,7 +194,7 @@ export default function HarnessSettings({ onChange, onSelect }: {
           <div className="settings-field">
             <label className="settings-field-label" htmlFor="harness-model">模型覆盖</label>
             <div className="settings-field-body">
-              {(runtime === 'codex' || runtime === 'opencode') && (
+              {(runtime === 'opencode' || (runtime === 'codex' && !codexEnabled)) && (
                 <div className="settings-native-models">
                   <SettingsSelect label="原生模型" value={model} disabled={busy || settings?.locked}
                     options={[
@@ -152,12 +210,81 @@ export default function HarnessSettings({ onChange, onSelect }: {
               )}
               <input id="harness-model" className="mock" value={model} disabled={busy || settings?.locked} maxLength={240}
               onChange={(event) => setModel(event.target.value)}
-              placeholder={runtime === 'codex' ? '留空使用 Codex 原生配置' : 'provider/model；留空使用原生配置'} />
-              <p className="desc">可从原生 CLI 列表选择，也可手动填写；留空沿用原生默认模型，不修改其它底座的供应商配置。
-                模型是否可用仍取决于当前账号、供应商和原生 CLI 支持。</p>
+              placeholder={customCodex
+                ? '填写自定义 API 的模型名'
+                : runtime === 'codex' ? '留空使用 Codex 原生配置' : 'provider/model；留空使用原生配置'} />
+              <p className="desc">{customCodex
+                ? '这里填写上游 Responses API 的真实模型名；Codex 会通过 Easel 专用 provider 使用它。'
+                : '可从原生 CLI 列表选择，也可手动填写；留空沿用原生默认模型，不修改其它底座的供应商配置。' +
+                  '模型是否可用仍取决于当前账号、供应商和原生 CLI 支持。'}</p>
               {modelNote && <p className="desc" role="status">{modelNote}</p>}
             </div>
           </div>
+          {runtime === 'codex' && (
+            <div className="settings-field">
+              <span className="settings-field-label">自定义 API</span>
+              <div className="settings-field-body">
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <button type="button" role="switch" aria-checked={codexEnabled}
+                    aria-label="使用 Codex 自定义 API" className="settings-permission-switch"
+                    disabled={busy || settingsLoading || !settings || settings.locked}
+                    onClick={() => {
+                      setCodexEnabled((previous) => !previous);
+                      setCodexTest(null);
+                    }}>
+                    <span className="settings-permission-switch__thumb" />
+                  </button>
+                  <span className="desc" style={{ margin: 0 }}>
+                    {codexEnabled ? '使用自定义 Base URL 与 API Key' : '使用 Codex 原生登录'}
+                  </span>
+                </div>
+                {codexEnabled && (
+                  <div style={{ display: 'grid', gap: 8, marginTop: 12 }}>
+                    <div className="desc" style={{ margin: 0 }}>
+                      协议：OpenAI Responses（请求到 <code>/responses</code>）
+                    </div>
+                    <input className="mock" value={codexBase} maxLength={300}
+                      disabled={busy || settings?.locked}
+                      placeholder="https://api.example.com/v1"
+                      aria-label="Codex 自定义 API Base URL"
+                      onChange={(event) => {
+                        setCodexBase(event.target.value);
+                        setCodexTest(null);
+                      }} />
+                    <input className="mock" type="password" value={codexKey} maxLength={400}
+                      disabled={busy || settings?.locked}
+                      placeholder={codexKeyMasked || '粘贴 API Key'}
+                      aria-label="Codex 自定义 API Key"
+                      onChange={(event) => {
+                        setCodexKey(event.target.value);
+                        setCodexTest(null);
+                      }} />
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                      <button type="button" className="btn btn-sm"
+                        disabled={codexTesting || busy || settings?.locked}
+                        onClick={() => void testCodexAPI()}>
+                        {codexTesting ? <><span className="spin" />测试中…</> : '测试连通'}
+                      </button>
+                      {codexTest && (
+                        <span className={`stt ${codexTest.ok ? 'good' : 'bad'}`} title={codexTest.detail}>
+                          {codexTest.text}
+                        </span>
+                      )}
+                    </div>
+                    <p className="desc" style={{ margin: 0 }}>
+                      Base URL 填到 <code>/v1</code> 层级。测试会向上游发送一次最小真实请求，
+                      验证地址、Key、模型和 Responses 协议；Key 留空时使用已保存的 Key。
+                    </p>
+                  </div>
+                )}
+                <p className="desc">
+                  当前 Codex CLI 只支持 OpenAI Responses 协议。需要 Chat Completions
+                  （<code>/chat/completions</code>）时，请切换到“仅聊天模式”或 OpenClaw 配置，
+                  两处都支持自定义 URL、Key 和模型连通测试。
+                </p>
+              </div>
+            </div>
+          )}
           {runtime === 'codex' && (
             <>
             <div className="settings-field">
@@ -198,7 +325,9 @@ export default function HarnessSettings({ onChange, onSelect }: {
             </div>
             </>
           )}
-          <p className="desc">认证由原生 CLI 管理，Easel 不迁移密钥。
+          <p className="desc">{runtime === 'codex' && codexEnabled
+            ? '此模式由 Easel 使用隔离的 Codex provider 启动，不改写全局 ~/.codex/config.toml；Key 持久化在本机 .env。'
+            : '认证由原生 CLI 管理，Easel 不迁移密钥。'}
             {fullAccess ? '完全访问模式下，Codex 不会再弹出技术执行授权；'
               : '未自动批准的额外权限需在对话中确认；'}
             OpenCode / 通用 ACP 使用其原生权限策略，不是 Codex 权限模式。</p>

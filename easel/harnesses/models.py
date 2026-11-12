@@ -9,6 +9,7 @@ from easel import __version__
 
 from .base import HarnessError, RunRequest
 from .commands import base_command
+from .codex_config import app_server_command, custom_api
 from .rpc import RPC
 
 
@@ -24,7 +25,8 @@ async def available_models(runtime: str, request: RunRequest) -> list[dict]:
 
         models = []
         cursor = None
-        async with RPC(request, base_command("codex") + ["app-server"],
+        async with RPC(request, app_server_command(
+                           request, custom_api(request.env, request.model, require_model=False)),
                        lambda method, params: None, reject) as rpc:
             await rpc.call("initialize", {
                 "clientInfo": {"name": "easel", "version": __version__},
